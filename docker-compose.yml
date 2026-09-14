@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    image: gas-adjudication-api
+    ports:
+      # Host port is overridable: API_PORT=9000 docker compose up api
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # One-shot test service: runs the pytest suite and exits.
+  #   docker compose run --rm verify
+  #   docker compose up --exit-code-from verify verify
+  verify:
+    build: .
+    image: gas-adjudication-api
+    command: ["python", "-m", "pytest", "-q"]
