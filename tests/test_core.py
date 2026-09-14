@@ -11,6 +11,8 @@ from app.core import (
     CATEGORY_PPM_PRECISION_EXCEEDED,
     adjudicate,
     analyze_exceedance,
+    area_share_percent,
+    find_dominant_interval,
     find_first_failure,
     format_seconds,
     integrate,
@@ -354,6 +356,75 @@ class TestAnalyzeExceedance:
             format_seconds(summary.longest.end),
             format_seconds(summary.longest.duration),
         ) == ("3.333", "4.667", "1.333")
+
+
+class TestFindDominantInterval:
+    """Adjacent-point interval contributing the most trapezoidal area."""
+
+    def test_long_high_tail_dominates(self):
+        # Same sequence as the uneven-spacing adjudication test: the long
+        # 100 ppm tail, not the 100 s ramp, must dominate the contribution.
+        seq = points((0, "0"), (100, "0"), (200, "100"), (28800, "0"))
+        interval = find_dominant_interval(seq)
+        assert (interval.start, interval.end) == (200, 28800)
+        assert interval.area == Decimal("1430000")
+
+    def test_area_tie_resolves_to_earliest_start(self):
+        # (0, 100) and (300, 400) both contribute exactly 5000 ppm*seconds.
+        seq = points(
+            (0, "50"), (100, "50"), (200, "0"),
+            (300, "50"), (400, "50"), (500, "0"),
+            (28800, "0"),
+        )
+        interval = find_dominant_interval(seq)
+        assert (interval.start, interval.end) == (0, 100)
+        assert interval.area == Decimal("5000")
+
+    def test_all_zero_sequence_picks_first_interval(self):
+        seq = points((0, "0"), (14400, "0"), (28800, "0"))
+        interval = find_dominant_interval(seq)
+        assert (interval.start, interval.end) == (0, 14400)
+        assert interval.area == Decimal("0")
+
+    def test_two_point_sequence_has_a_single_interval(self):
+        seq = points((0, "0"), (28800, "2"))
+        interval = find_dominant_interval(seq)
+        assert (interval.start, interval.end) == (0, 28800)
+        assert interval.area == Decimal("28800")
+
+    def test_fractional_segment_areas_stay_exact(self):
+        # (0.001+0.002)*3/2 = 0.0045 versus (0.002+0.001)*28797/2 = 43.1955.
+        seq = points((0, "0.001"), (3, "0.002"), (28800, "0.001"))
+        interval = find_dominant_interval(seq)
+        assert (interval.start, interval.end) == (3, 28800)
+        assert interval.area == Decimal("43.1955")
+
+    def test_fewer_than_two_points_is_rejected(self):
+        with pytest.raises(ValueError):
+            find_dominant_interval(points((0, "1")))
+
+
+class TestAreaSharePercent:
+    def test_quarter(self):
+        assert area_share_percent(Decimal("1"), Decimal("4")) == Decimal("25.000")
+
+    def test_full_share(self):
+        assert area_share_percent(Decimal("28800"), Decimal("28800")) == Decimal(
+            "100.000"
+        )
+
+    def test_repeating_quotient_rounds_to_three_places(self):
+        # 5000/17500 = 2/7 = 28.571428... percent.
+        assert area_share_percent(Decimal("5000"), Decimal("17500")) == Decimal(
+            "28.571"
+        )
+
+    def test_rounds_half_up_away_from_zero(self):
+        # 0.002/16*100 = 0.0125 exactly; ROUND_HALF_EVEN would give 0.012.
+        assert area_share_percent(Decimal("0.002"), Decimal("16")) == Decimal("0.013")
+
+    def test_zero_total_is_defined_as_zero(self):
+        assert area_share_percent(Decimal("0"), Decimal("0")) == Decimal("0.000")
 
 
 class TestFormatSeconds:

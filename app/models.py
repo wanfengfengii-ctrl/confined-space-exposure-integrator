@@ -44,20 +44,39 @@ class Exceedance(BaseModel):
     longest_segment: Optional[ExceedanceSegment]
 
 
+class DominantInterval(BaseModel):
+    """The adjacent-sample interval contributing the most to the total area.
+
+    Attached only for ``include_dominant_interval=true`` requests.
+    ``start``/``end`` are the bounding sample timestamps in seconds;
+    ``area`` is the exact trapezoidal area serialized as a string (like the
+    top-level ``area``); ``percentage`` is the interval's share of the total
+    area, ROUND_HALF_UP to three decimals — ``"0.000"`` when the total area
+    is zero.
+    """
+
+    start: int
+    end: int
+    area: str
+    percentage: str
+
+
 class AdjudicationResult(BaseModel):
     """Successful adjudication payload.
 
     ``area`` and ``equivalent`` are serialized as strings so the exact
     decimal representation (including trailing zeros) survives the round
     trip without binary floating-point noise.  ``exceedance`` is populated
-    only for ``include_exceedance=true`` requests; the field is omitted
-    entirely otherwise.
+    only for ``include_exceedance=true`` requests and ``dominant_interval``
+    only for ``include_dominant_interval=true`` requests; each field is
+    omitted entirely otherwise.
     """
 
     area: str
     equivalent: str
     verdict: Literal["PASS", "FAIL"]
     exceedance: Optional[Exceedance] = None
+    dominant_interval: Optional[DominantInterval] = None
 
 
 class ErrorBody(BaseModel):

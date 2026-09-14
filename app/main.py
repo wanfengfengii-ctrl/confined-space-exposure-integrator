@@ -1,5 +1,6 @@
 """FastAPI application exposing the eight-hour gas adjudication endpoint."""
 
+from decimal import Decimal
 from typing import Optional, Sequence
 
 from fastapi import FastAPI, Query, Request
@@ -11,10 +12,13 @@ from .core import (
     ValidationFailure,
     adjudicate,
     analyze_exceedance,
+    area_share_percent,
+    find_dominant_interval,
     format_seconds,
 )
 from .models import (
     AdjudicationResult,
+    DominantInterval,
     ErrorEnvelope,
     Exceedance,
     ExceedanceSegment,
@@ -105,6 +109,13 @@ async def adjudicate_sequence(
             "to the response."
         ),
     ),
+    include_dominant_interval: bool = Query(
+        default=False,
+        description=(
+            "Attach the adjacent-sample interval contributing the most "
+            "to the total area."
+        ),
+    ),
 ) -> AdjudicationResult:
     # The contract is a single JSON sampling sequence; anything submitted
     # without a JSON media type is rejected before any parsing happens.
@@ -121,15 +132,17 @@ async def adjudicate_sequence(
     # 422 carries the unique first failure as index + category.
     points = validate_sequence(decode_json_body(await request.body()))
     # The whole batch is validated, then adjudicated, exactly as in the main
-    # flow; the exceedance analysis runs only after both have succeeded, so a
-    # failure here can never leak area, equivalent, or verdict — a bad batch
-    # still returns its single first-failure envelope.
+    # flow; the exceedance and dominant-interval analyses run only after both
+    # have succeeded, so a failure here can never leak area, equivalent, or
+    # verdict — a bad batch still returns its single first-failure envelope.
     area, equivalent, verdict = adjudicate(points)
     result = AdjudicationResult(
         area=str(area), equivalent=str(equivalent), verdict=verdict
     )
     if include_exceedance:
         result.exceedance = _build_exceedance(points)
+    if include_dominant_interval:
+        result.dominant_interval = _build_dominant_interval(points, area)
     return result
 
 
@@ -146,6 +159,19 @@ def _build_exceedance(points: Sequence[SamplePoint]) -> Exceedance:
     return Exceedance(
         total_seconds=format_seconds(summary.total_seconds),
         longest_segment=longest,
+    )
+
+
+def _build_dominant_interval(
+    points: Sequence[SamplePoint], total_area: Decimal
+) -> DominantInterval:
+    """Run the interval-contribution analysis and map it to the wire model."""
+    interval = find_dominant_interval(points)
+    return DominantInterval(
+        start=interval.start,
+        end=interval.end,
+        area=str(interval.area),
+        percentage=str(area_share_percent(interval.area, total_area)),
     )
 
 

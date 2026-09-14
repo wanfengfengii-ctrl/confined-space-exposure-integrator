@@ -17,6 +17,7 @@ MAX_PPM_DECIMAL_PLACES = 3
 PASS_THRESHOLD = Decimal("25.000")
 EQUIVALENT_QUANTUM = Decimal("0.001")
 SECOND_QUANTUM = Decimal("0.001")
+PERCENT_QUANTUM = Decimal("0.001")
 # Working precision for the crossing analysis and the tolerance used to tell
 # genuinely different segment durations apart.  Inputs carry 3-decimal ppm
 # and integer seconds; at 40-digit precision the accumulated division tail
@@ -69,6 +70,20 @@ class ExceedanceSummary:
 
     total_seconds: Decimal
     longest: Optional[ExceedanceSegment]
+
+
+@dataclass(frozen=True)
+class DominantInterval:
+    """The adjacent-point interval contributing the most to the total area.
+
+    ``start``/``end`` are the bounding sample timestamps (seconds since
+    window start); ``area`` is the interval's exact trapezoidal area in
+    ppm*seconds.
+    """
+
+    start: int
+    end: int
+    area: Decimal
 
 
 class DomainValidationError(Exception):
@@ -152,6 +167,14 @@ def find_first_failure(points: Sequence[SamplePoint]) -> Optional[ValidationFail
     return None
 
 
+def _segment_areas(points: Sequence[SamplePoint]) -> list[Decimal]:
+    """Exact trapezoidal area of every adjacent-point segment, in order."""
+    return [
+        (previous.ppm + current.ppm) * (current.timestamp - previous.timestamp) / 2
+        for previous, current in zip(points, points[1:])
+    ]
+
+
 def integrate(points: Sequence[SamplePoint]) -> Decimal:
     """Exact trapezoidal area in ppm*seconds over the sampled sequence.
 
@@ -160,9 +183,8 @@ def integrate(points: Sequence[SamplePoint]) -> Decimal:
     intervals weight long high-concentration stretches correctly.
     """
     area = Decimal("0")
-    for previous, current in zip(points, points[1:]):
-        delta_seconds = current.timestamp - previous.timestamp
-        area += (previous.ppm + current.ppm) * delta_seconds / 2
+    for segment_area in _segment_areas(points):
+        area += segment_area
     return area
 
 
@@ -177,6 +199,37 @@ def adjudicate(points: Sequence[SamplePoint]) -> tuple[Decimal, Decimal, Verdict
     equivalent = equivalent_value(area)
     verdict: Verdict = "PASS" if equivalent <= PASS_THRESHOLD else "FAIL"
     return area, equivalent, verdict
+
+
+def find_dominant_interval(points: Sequence[SamplePoint]) -> DominantInterval:
+    """Locate the adjacent-point interval contributing the most area.
+
+    Candidate areas are exactly the per-segment trapezoids summed by
+    :func:`integrate`.  Scanning in sampling order and replacing the best
+    only on a strictly larger area keeps the earliest interval when several
+    contribute identical areas — including an all-zero sequence, where the
+    first interval wins at area zero.
+    """
+    best: Optional[DominantInterval] = None
+    for previous, current, area in zip(points, points[1:], _segment_areas(points)):
+        if best is None or area > best.area:
+            best = DominantInterval(
+                start=previous.timestamp, end=current.timestamp, area=area
+            )
+    if best is None:
+        raise ValueError("dominant interval requires at least two sample points")
+    return best
+
+
+def area_share_percent(part: Decimal, whole: Decimal) -> Decimal:
+    """``part`` as a percentage of ``whole``, ROUND_HALF_UP to three places.
+
+    A zero total means every segment contributed nothing, so the share is
+    defined as exactly ``0.000`` instead of being left undefined.
+    """
+    if whole == 0:
+        return Decimal("0.000")
+    return (part / whole * 100).quantize(PERCENT_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def format_seconds(value: Decimal) -> str:

@@ -37,9 +37,10 @@ verdict    = PASS  若 equivalent ≤ 25.000，否则 FAIL
 
 查询参数（均为可选）：
 
-| 参数                 | 类型    | 默认   | 说明                                                                                                                                 |
-| -------------------- | ------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `include_exceedance` | 布尔量  | `false` | 为真时，在完成原有整批校验与裁决**之后**，把相邻采样点之间按线性变化处理，附加严格高于 `25.000` ppm 的超限分析（见下）。取值遵循 FastAPI 布尔解析：`true`/`1`/`yes`/`on`（大小写不敏感）为真，`false`/`0`/`no`/`off` 为假；无法解析时返回 `422`，错误定位于查询参数 `include_exceedance`。 |
+| 参数                        | 类型    | 默认   | 说明                                                                                                                                 |
+| --------------------------- | ------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `include_exceedance`        | 布尔量  | `false` | 为真时，在完成原有整批校验与裁决**之后**，把相邻采样点之间按线性变化处理，附加严格高于 `25.000` ppm 的超限分析（见下）。取值遵循 FastAPI 布尔解析：`true`/`1`/`yes`/`on`（大小写不敏感）为真，`false`/`0`/`no`/`off` 为假；无法解析时返回 `422`，错误定位于查询参数 `include_exceedance`。 |
+| `include_dominant_interval` | 布尔量  | `false` | 为真时，在完成整批校验与裁决**之后**，附加对总面积贡献最大的相邻采样点区间分析（见下）。布尔解析规则与 `include_exceedance` 相同；无法解析时返回 `422`，错误定位于查询参数 `include_dominant_interval`。 |
 
 #### 合法响应 `200`
 
@@ -99,6 +100,34 @@ Decimal 精确值，仅在序列化时对每个输出值单独 `ROUND_HALF_UP` �
 
 > 超限分析是纯粹的附加结果：任何采样无效情形仍只返回既有"唯一首错"信封，
 > 且分析阶段在面积/裁决计算之后才运行，异常时也不会泄漏面积或裁决。
+
+##### `include_dominant_interval=true` 时附加的 `dominant_interval`
+
+复用逐段 `Decimal` 梯形面积，选出对总面积贡献最大的相邻采样点区间；面积相同
+取起点最早者（全零采样时各段面积均为零，首个区间胜出）：
+
+```json
+{
+  "area": "1435000",
+  "equivalent": "49.826",
+  "verdict": "FAIL",
+  "dominant_interval": {
+    "start": 200,
+    "end": 28800,
+    "area": "1430000",
+    "percentage": "99.652"
+  }
+}
+```
+
+- `start` / `end`：区间起止采样点的秒数（整数，即原始采样时间戳）
+- `area`：该区间的原始梯形面积（未舍入的精确十进制字符串）
+- `percentage`：区间面积占总面积的百分比，按 `ROUND_HALF_UP` 保留三位并以
+  字符串表示；总面积为零时固定返回 `"0.000"`
+
+> 与超限分析相同，主导区间分析是纯粹的附加结果：只在整批校验与裁决完成之后
+> 运行，不参与也不改变 PASS/FAIL 裁决与超限分析；省略或关闭参数时响应与
+> 既有版本逐字段一致。
 
 #### 校验失败响应 `422`
 
@@ -168,6 +197,15 @@ curl -X POST 'http://localhost:8000/adjudicate?include_exceedance=true' \
 # => {"area":"576100","equivalent":"20.003","verdict":"PASS",
 #     "exceedance":{"total_seconds":"10",
 #       "longest_segment":{"start":"5","end":"15","duration_seconds":"10"}}}
+
+# 主导区间：200–28800 秒的 100 ppm 长尾贡献了总面积的 99.652%
+curl -X POST 'http://localhost:8000/adjudicate?include_dominant_interval=true' \
+  -H 'Content-Type: application/json' \
+  -d '[{"timestamp":0,"ppm":0},{"timestamp":100,"ppm":0},
+       {"timestamp":200,"ppm":100},{"timestamp":28800,"ppm":0}]'
+# => {"area":"1435000","equivalent":"49.826","verdict":"FAIL",
+#     "dominant_interval":{"start":200,"end":28800,"area":"1430000",
+#       "percentage":"99.652"}}
 
 # 查询参数无法解析为布尔值 → 422，定位到该查询参数（采样体不参与处理）
 curl -X POST 'http://localhost:8000/adjudicate?include_exceedance=maybe' \
@@ -254,3 +292,7 @@ requirements.txt
   完成后做穿越分析；相邻采样点按线性变化处理，穿越秒点与持续时长全部使用
   `Decimal`（秒值至多三位小数）。该分析不参与 PASS/FAIL 裁决，任何异常也不会
   回泄面积或裁决；省略参数时响应与当前版本逐字段一致。
+- **主导区间按需附加**：仅当 `include_dominant_interval=true` 时，才在既有校验
+  与裁决完成后，复用逐段 `Decimal` 梯形面积选出对总面积贡献最大的相邻点区间
+  （面积并列取起点最早者）；百分比按 `ROUND_HALF_UP` 保留三位，总面积为零时
+  固定 `"0.000"`。该分析同样不参与裁决，省略参数时响应逐字段保持现状。
