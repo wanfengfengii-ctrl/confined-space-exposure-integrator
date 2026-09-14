@@ -1,10 +1,23 @@
 """FastAPI application exposing the eight-hour gas adjudication endpoint."""
 
-from fastapi import FastAPI, Request
+from typing import Sequence
+
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from .core import DomainValidationError, adjudicate
-from .models import AdjudicationResult, ErrorEnvelope
+from .core import (
+    DomainValidationError,
+    adjudicate,
+    analyze_exceedance,
+    format_seconds,
+)
+from .models import (
+    AdjudicationResult,
+    ErrorEnvelope,
+    Exceedance,
+    ExceedanceSegment,
+    SamplePoint,
+)
 from .parsing import decode_json_body, validate_sequence
 
 app = FastAPI(
@@ -40,6 +53,7 @@ async def domain_validation_handler(
 @app.post(
     "/adjudicate",
     response_model=AdjudicationResult,
+    response_model_exclude_unset=True,
     responses={422: {"model": ErrorEnvelope, "description": "Validation failure"}},
     openapi_extra={
         "requestBody": {
@@ -80,14 +94,46 @@ async def domain_validation_handler(
         }
     },
 )
-async def adjudicate_sequence(request: Request) -> AdjudicationResult:
+async def adjudicate_sequence(
+    request: Request,
+    include_exceedance: bool = Query(
+        default=False,
+        description=(
+            "Attach the strictly-above-25.000 ppm exceedance analysis "
+            "to the response."
+        ),
+    ),
+) -> AdjudicationResult:
     # The raw body is decoded and validated by the domain layer (not by the
     # framework) so decimal literals keep their exact lexical form and every
     # 422 carries the unique first failure as index + category.
     points = validate_sequence(decode_json_body(await request.body()))
+    # The whole batch is validated, then adjudicated, exactly as in the main
+    # flow; the exceedance analysis runs only after both have succeeded, so a
+    # failure here can never leak area, equivalent, or verdict — a bad batch
+    # still returns its single first-failure envelope.
     area, equivalent, verdict = adjudicate(points)
-    return AdjudicationResult(
+    result = AdjudicationResult(
         area=str(area), equivalent=str(equivalent), verdict=verdict
+    )
+    if include_exceedance:
+        result.exceedance = _build_exceedance(points)
+    return result
+
+
+def _build_exceedance(points: Sequence[SamplePoint]) -> Exceedance:
+    """Run the crossing analysis and map it to the wire model."""
+    summary = analyze_exceedance(points)
+    longest = None
+    if summary.longest is not None:
+        longest = ExceedanceSegment(
+            start=format_seconds(summary.longest.start),
+            end=format_seconds(summary.longest.end),
+            duration_seconds=format_seconds(summary.longest.duration),
+        )
+    return Exceedance(
+        total_seconds=format_seconds(summary.total_seconds),
+        longest_segment=longest,
     )
 
 

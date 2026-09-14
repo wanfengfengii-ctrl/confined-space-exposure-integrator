@@ -325,6 +325,228 @@ class TestMalformedBodies:
         assert_error_envelope(response.json(), 0, "invalid_type")
 
 
+class TestExceedance:
+    """``include_exceedance`` opt-in threshold-crossing analysis."""
+
+    TWO_CROSSINGS_SEQUENCE = [
+        {"timestamp": 0, "ppm": 20},
+        {"timestamp": 10, "ppm": 30},
+        {"timestamp": 20, "ppm": 20},
+        {"timestamp": 28800, "ppm": 20},
+    ]
+
+    def test_default_call_omits_exceedance_completely(self):
+        response = client.post("/adjudicate", json=VALID_SEQUENCE)
+        assert response.status_code == 200
+        assert set(response.json().keys()) == {"area", "equivalent", "verdict"}
+
+    @pytest.mark.parametrize("flag", ["false", "0", "no", "False", "OFF"])
+    def test_falsey_values_omit_exceedance(self, flag):
+        response = client.post(
+            f"/adjudicate?include_exceedance={flag}", json=VALID_SEQUENCE
+        )
+        assert response.status_code == 200
+        assert "exceedance" not in response.json()
+
+    @pytest.mark.parametrize("flag", ["true", "1", "yes", "on", "TRUE"])
+    def test_truthy_values_attach_exceedance(self, flag):
+        response = client.post(
+            f"/adjudicate?include_exceedance={flag}", json=VALID_SEQUENCE
+        )
+        assert response.status_code == 200
+        assert response.json()["exceedance"] == {
+            "total_seconds": "0",
+            "longest_segment": None,
+        }
+
+    def test_two_crossings_between_samples_are_interpolated(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=self.TWO_CROSSINGS_SEQUENCE,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        # Main verdict payload is unchanged; exceedance is purely additive.
+        assert body["area"] == "576100"
+        assert body["equivalent"] == "20.003"
+        assert body["verdict"] == "PASS"
+        # 20 -> 30 crosses 25 at second 5, 30 -> 20 crosses back at 15.
+        assert body["exceedance"] == {
+            "total_seconds": "10",
+            "longest_segment": {
+                "start": "5",
+                "end": "15",
+                "duration_seconds": "10",
+            },
+        }
+
+    def test_fractional_crossings_serialize_with_three_decimal_places(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[
+                {"timestamp": 0, "ppm": 0},
+                {"timestamp": 10, "ppm": 30},
+                {"timestamp": 20, "ppm": 0},
+                {"timestamp": 28800, "ppm": 0},
+            ],
+        )
+        assert response.status_code == 200
+        segment = response.json()["exceedance"]["longest_segment"]
+        assert segment == {
+            "start": "8.333",
+            "end": "11.667",
+            "duration_seconds": "3.334",
+        }
+
+    def test_contiguous_stretch_merges_across_several_segments(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[
+                {"timestamp": 0, "ppm": 0},
+                {"timestamp": 5, "ppm": 50},
+                {"timestamp": 10, "ppm": 50},
+                {"timestamp": 15, "ppm": 50},
+                {"timestamp": 20, "ppm": 0},
+                {"timestamp": 28800, "ppm": 0},
+            ],
+        )
+        assert response.status_code == 200
+        assert response.json()["exceedance"] == {
+            "total_seconds": "15",
+            "longest_segment": {
+                "start": "2.5",
+                "end": "17.5",
+                "duration_seconds": "15",
+            },
+        }
+
+    def test_tied_longest_segments_return_the_earlier_one(self):
+        # Two triangular excursions that both round to 3.334 seconds.
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[
+                {"timestamp": 0, "ppm": 0},
+                {"timestamp": 10, "ppm": 30},
+                {"timestamp": 20, "ppm": 0},
+                {"timestamp": 100, "ppm": 0},
+                {"timestamp": 110, "ppm": 30},
+                {"timestamp": 120, "ppm": 0},
+                {"timestamp": 28800, "ppm": 0},
+            ],
+        )
+        assert response.status_code == 200
+        assert response.json()["exceedance"] == {
+            "total_seconds": "6.668",
+            "longest_segment": {
+                "start": "8.333",
+                "end": "11.667",
+                "duration_seconds": "3.334",
+            },
+        }
+
+    def test_threshold_point_separates_two_stretches(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[
+                {"timestamp": 0, "ppm": 0},
+                {"timestamp": 10, "ppm": 30},
+                {"timestamp": 20, "ppm": 25},
+                {"timestamp": 30, "ppm": 30},
+                {"timestamp": 45, "ppm": 0},
+                {"timestamp": 28800, "ppm": 0},
+            ],
+        )
+        assert response.status_code == 200
+        # 8.333 -> 20 (11.667 s) versus 20 -> 32.5 (12.5 s): second wins.
+        assert response.json()["exceedance"] == {
+            "total_seconds": "24.167",
+            "longest_segment": {
+                "start": "20",
+                "end": "32.5",
+                "duration_seconds": "12.5",
+            },
+        }
+
+    def test_constantly_equal_to_threshold_is_not_an_exceedance(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[{"timestamp": 0, "ppm": 25}, {"timestamp": 28800, "ppm": 25}],
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["verdict"] == "PASS"
+        assert body["exceedance"] == {
+            "total_seconds": "0",
+            "longest_segment": None,
+        }
+
+    def test_only_touching_threshold_at_peak_is_not_an_exceedance(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[
+                {"timestamp": 0, "ppm": 0},
+                {"timestamp": 100, "ppm": 25},
+                {"timestamp": 200, "ppm": 0},
+                {"timestamp": 28800, "ppm": 0},
+            ],
+        )
+        assert response.status_code == 200
+        assert response.json()["exceedance"] == {
+            "total_seconds": "0",
+            "longest_segment": None,
+        }
+
+    @pytest.mark.parametrize("bad_value", ["maybe", "2", "", "tru", "yes!"])
+    def test_unparseable_boolean_is_422_located_at_query_parameter(
+        self, bad_value
+    ):
+        response = client.post(
+            f"/adjudicate?include_exceedance={bad_value}", json=VALID_SEQUENCE
+        )
+        assert response.status_code == 422
+        body = response.json()
+        # The framework's query-parameter error envelope must not carry any
+        # of the adjudication payload keys.
+        assert set(body.keys()) == {"detail"}
+        detail = body["detail"]
+        assert isinstance(detail, list) and len(detail) == 1
+        assert set(detail[0].keys()) == {"type", "loc", "msg", "input"}
+        assert detail[0]["loc"] == ["query", "include_exceedance"]
+        assert detail[0]["input"] == bad_value
+        for forbidden in ("area", "equivalent", "verdict"):
+            assert forbidden not in response.text
+
+    def test_invalid_sample_with_flag_still_returns_first_error_only(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[
+                {"timestamp": 0, "ppm": 30},
+                {"timestamp": 100, "ppm": 2000},
+                {"timestamp": 28800, "ppm": 30},
+            ],
+        )
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 1, "ppm_out_of_range")
+        assert "exceedance" not in response.text
+
+    def test_analysis_failure_never_leaks_area_or_verdict(self, monkeypatch):
+        # Even if the new analysis blows up after adjudication already ran,
+        # the response must be a plain server error, never a partial payload.
+        secret = "SECRET-AREA-720000-VERDICT-PASS"
+
+        def boom(_points):
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr("app.main.analyze_exceedance", boom)
+        guarded = TestClient(app, raise_server_exceptions=False)
+        response = guarded.post(
+            "/adjudicate?include_exceedance=true", json=VALID_SEQUENCE
+        )
+        assert response.status_code == 500
+        for forbidden in ("area", "equivalent", "verdict", "exceedance", secret):
+            assert forbidden not in response.text
+
+
 class TestHealthAndDocs:
     def test_healthz(self):
         response = client.get("/healthz")
@@ -337,3 +559,14 @@ class TestHealthAndDocs:
         operation = response.json()["paths"]["/adjudicate"]["post"]
         schema = operation["requestBody"]["content"]["application/json"]["schema"]
         assert schema["type"] == "array"
+
+    def test_openapi_documents_optional_boolean_query_parameter(self):
+        response = client.get("/openapi.json")
+        parameters = response.json()["paths"]["/adjudicate"]["post"]["parameters"]
+        [parameter] = [
+            p for p in parameters if p["name"] == "include_exceedance"
+        ]
+        assert parameter["in"] == "query"
+        assert parameter["required"] is False
+        assert parameter["schema"]["type"] == "boolean"
+        assert parameter["schema"]["default"] is False

@@ -32,7 +32,15 @@ verdict    = PASS  若 equivalent ≤ 25.000，否则 FAIL
 `ppm` 必须是 JSON 数字；字符串形式（即使内容合法，如 `"12.340"`）会按
 `invalid_type` 整批拒绝。
 
+查询参数（均为可选）：
+
+| 参数                 | 类型    | 默认   | 说明                                                                                                                                 |
+| -------------------- | ------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `include_exceedance` | 布尔量  | `false` | 为真时，在完成原有整批校验与裁决**之后**，把相邻采样点之间按线性变化处理，附加严格高于 `25.000` ppm 的超限分析（见下）。取值遵循 FastAPI 布尔解析：`true`/`1`/`yes`/`on`（大小写不敏感）为真，`false`/`0`/`no`/`off` 为假；无法解析时返回 `422`，错误定位于查询参数 `include_exceedance`。 |
+
 #### 合法响应 `200`
+
+省略 `include_exceedance`（或显式给假值）时，响应结构与既有版本完全一致：
 
 ```json
 {
@@ -45,6 +53,44 @@ verdict    = PASS  若 equivalent ≤ 25.000，否则 FAIL
 - `area`：原始积分面积（未舍入的精确十进制，序列化为字符串以保留精确表示）
 - `equivalent`：三位小数的八小时等效值（字符串，如 `"25.000"`）
 - `verdict`：唯一裁决，`"PASS"` 或 `"FAIL"`
+
+##### `include_exceedance=true` 时附加的 `exceedance`
+
+相邻采样点之间视为线性浓度曲线，用 `Decimal` 求解浓度穿越 `25.000` ppm 的
+精确秒点（穿越秒点按 `ROUND_HALF_UP` 保留至多三位小数，即毫秒精度）：
+
+```
+t_cross = t_i + (25.000 − ppm_i) ÷ (ppm_i+1 − ppm_i) × (t_i+1 − t_i)
+```
+
+仅统计**严格高于**阈值的时间；恰好等于阈值的采样点或区段不计超限。多个在
+（严格高于阈值的）采样点处相接的区段合并为一条最大连续区段；若最长持续时间
+并列，返回开始秒数最早的区段。
+
+```json
+{
+  "area": "576100",
+  "equivalent": "20.003",
+  "verdict": "PASS",
+  "exceedance": {
+    "total_seconds": "10",
+    "longest_segment": {
+      "start": "5",
+      "end": "15",
+      "duration_seconds": "10"
+    }
+  }
+}
+```
+
+- `total_seconds`：严格高于阈值的累计秒数（字符串，至多三位小数；无超限时为 `"0"`）
+- `longest_segment.start` / `end`：最长连续超限区段的起止秒（字符串，至多三位小数）
+- `longest_segment.duration_seconds`：该区段持续秒数（字符串，至多三位小数）
+- 全程未严格超过阈值（例如全程恰为 `25.000`，或只在峰值瞬时触及 `25.000`）时：
+  `total_seconds` 为 `"0"`、`longest_segment` 为 `null`
+
+> 超限分析是纯粹的附加结果：任何采样无效情形仍只返回既有"唯一首错"信封，
+> 且分析阶段在面积/裁决计算之后才运行，异常时也不会泄漏面积或裁决。
 
 #### 校验失败响应 `422`
 
@@ -104,6 +150,22 @@ curl -X POST http://localhost:8000/adjudicate \
   -H 'Content-Type: application/json' \
   -d '[{"timestamp":0,"ppm":1},{"timestamp":100,"ppm":1}]'
 # => 422 {"error":{"index":1,"category":"missing_endpoint","message":"..."}}
+
+# 瞬时越线判定：20→30→20 的小尖峰，插值得到第 5 秒上穿、第 15 秒下穿，
+# 严格高于 25.000 ppm 共 10 秒
+curl -X POST 'http://localhost:8000/adjudicate?include_exceedance=true' \
+  -H 'Content-Type: application/json' \
+  -d '[{"timestamp":0,"ppm":20},{"timestamp":10,"ppm":30},
+       {"timestamp":20,"ppm":20},{"timestamp":28800,"ppm":20}]'
+# => {"area":"576100","equivalent":"20.003","verdict":"PASS",
+#     "exceedance":{"total_seconds":"10",
+#       "longest_segment":{"start":"5","end":"15","duration_seconds":"10"}}}
+
+# 查询参数无法解析为布尔值 → 422，定位到该查询参数（采样体不参与处理）
+curl -X POST 'http://localhost:8000/adjudicate?include_exceedance=maybe' \
+  -H 'Content-Type: application/json' -d '[]'
+# => 422 {"detail":[{"type":"bool_parsing",
+#       "loc":["query","include_exceedance"], ...}]}
 
 # 四位尾随小数 → 422（精度按字面形式判定）
 curl -X POST http://localhost:8000/adjudicate \
@@ -178,3 +240,7 @@ requirements.txt
   表示（含末尾零，如 `"25.000"`），调用方可无损解析。
 - **先校验后计算**：任何校验失败都在积分之前整批拒绝，错误信封因此不可能泄漏
   面积、等效值或裁决。
+- **超限分析按需附加**：仅当 `include_exceedance=true` 时，才在既有校验与裁决
+  完成后做穿越分析；相邻采样点按线性变化处理，穿越秒点与持续时长全部使用
+  `Decimal`（秒值至多三位小数）。该分析不参与 PASS/FAIL 裁决，任何异常也不会
+  回泄面积或裁决；省略参数时响应与当前版本逐字段一致。

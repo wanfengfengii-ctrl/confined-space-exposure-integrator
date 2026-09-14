@@ -16,6 +16,7 @@ MAX_PPM = Decimal("1000")
 MAX_PPM_DECIMAL_PLACES = 3
 PASS_THRESHOLD = Decimal("25.000")
 EQUIVALENT_QUANTUM = Decimal("0.001")
+SECOND_QUANTUM = Decimal("0.001")
 
 CATEGORY_INVALID_TYPE = "invalid_type"
 CATEGORY_MISSING_ENDPOINT = "missing_endpoint"
@@ -33,6 +34,31 @@ class ValidationFailure:
     index: int
     category: str
     message: str
+
+
+@dataclass(frozen=True)
+class ExceedanceSegment:
+    """One maximal contiguous stretch strictly above the threshold.
+
+    ``start``/``end`` are seconds since window start; the concentration is
+    strictly above ``PASS_THRESHOLD`` on the open interval ``(start, end)``,
+    touching the threshold exactly at both endpoints.
+    """
+
+    start: Decimal
+    end: Decimal
+
+    @property
+    def duration(self) -> Decimal:
+        return self.end - self.start
+
+
+@dataclass(frozen=True)
+class ExceedanceSummary:
+    """Aggregate result of the threshold-crossing analysis."""
+
+    total_seconds: Decimal
+    longest: Optional[ExceedanceSegment]
 
 
 class DomainValidationError(Exception):
@@ -141,3 +167,78 @@ def adjudicate(points: Sequence[SamplePoint]) -> tuple[Decimal, Decimal, Verdict
     equivalent = equivalent_value(area)
     verdict: Verdict = "PASS" if equivalent <= PASS_THRESHOLD else "FAIL"
     return area, equivalent, verdict
+
+
+def format_seconds(value: Decimal) -> str:
+    """Serialize a seconds value with at most three decimal places.
+
+    Trailing zeros are stripped (``Decimal('100.000')`` -> ``"100"``), so
+    integral crossing seconds stay compact while fractional crossings retain
+    their exact digits up to the millisecond quantum.
+    """
+    text = format(value.quantize(SECOND_QUANTUM, rounding=ROUND_HALF_UP), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def analyze_exceedance(points: Sequence[SamplePoint]) -> ExceedanceSummary:
+    """Summarize time spent strictly above ``PASS_THRESHOLD`` ppm.
+
+    Adjacent samples are treated as a piecewise-linear concentration curve;
+    the crossing second within a segment from ``(t0, p0)`` to ``(t1, p1)``
+    is solved exactly as
+
+        t = t0 + (threshold - p0) / (p1 - p0) * (t1 - t0)
+
+    with Decimal arithmetic.  Above-threshold stretches that meet at a
+    sample point merge into one maximal segment.  Returns the total
+    strictly-above duration and the longest segment; ties resolve to the
+    earliest segment.  A curve that only ever equals (never exceeds) the
+    threshold yields a zero total and ``longest=None``.
+    """
+    intervals: list[tuple[Decimal, Decimal, int]] = []
+    for index, (previous, current) in enumerate(zip(points, points[1:])):
+        t0 = Decimal(previous.timestamp)
+        t1 = Decimal(current.timestamp)
+        p0 = previous.ppm
+        p1 = current.ppm
+        above0 = p0 > PASS_THRESHOLD
+        above1 = p1 > PASS_THRESHOLD
+        if above0 and above1:
+            intervals.append((t0, t1, index))
+        elif above0 or above1:
+            crossing = t0 + (PASS_THRESHOLD - p0) / (p1 - p0) * (t1 - t0)
+            # Crossings are reported at millisecond resolution; quantize once
+            # here so every derived figure (duration, total) stays consistent
+            # with the serialized endpoints.
+            crossing = crossing.quantize(SECOND_QUANTUM, rounding=ROUND_HALF_UP)
+            intervals.append(
+                (t0, crossing, index) if above0 else (crossing, t1, index)
+            )
+
+    segments: list[ExceedanceSegment] = []
+    for start, end, index in intervals:
+        # Quantization can collapse a sub-millisecond excursion to zero
+        # length; such an excursion contributes nothing and must not become
+        # the longest segment.
+        if start >= end:
+            continue
+        if (
+            segments
+            and start == segments[-1].end
+            # Only stretches sharing a sample that is itself strictly above
+            # the threshold are one continuous exceedance; a sample touching
+            # 25.000 exactly separates the stretches on either side.
+            and points[index].ppm > PASS_THRESHOLD
+        ):
+            segments[-1] = ExceedanceSegment(segments[-1].start, end)
+        else:
+            segments.append(ExceedanceSegment(start, end))
+
+    total = sum((segment.duration for segment in segments), Decimal("0"))
+    longest: Optional[ExceedanceSegment] = None
+    for segment in segments:
+        if longest is None or segment.duration > longest.duration:
+            longest = segment
+    return ExceedanceSummary(total_seconds=total, longest=longest)
