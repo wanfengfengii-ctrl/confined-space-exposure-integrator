@@ -17,6 +17,7 @@ MAX_PPM_DECIMAL_PLACES = 3
 PASS_THRESHOLD = Decimal("25.000")
 EQUIVALENT_QUANTUM = Decimal("0.001")
 
+CATEGORY_INVALID_TYPE = "invalid_type"
 CATEGORY_MISSING_ENDPOINT = "missing_endpoint"
 CATEGORY_NON_MONOTONIC_TIMESTAMP = "non_monotonic_timestamp"
 CATEGORY_PPM_OUT_OF_RANGE = "ppm_out_of_range"
@@ -34,18 +35,72 @@ class ValidationFailure:
     message: str
 
 
+class DomainValidationError(Exception):
+    """Carries the unique first :class:`ValidationFailure` of a batch."""
+
+    def __init__(self, failure: ValidationFailure) -> None:
+        super().__init__(failure.message)
+        self.failure = failure
+
+
 def _decimal_places(value: Decimal) -> int:
     """Number of fractional decimal places of a finite Decimal."""
     exponent = value.as_tuple().exponent
     return max(0, -exponent) if isinstance(exponent, int) else 0
 
 
-def find_first_failure(points: Sequence[SamplePoint]) -> Optional[ValidationFailure]:
-    """Return the unique first validation failure, or ``None`` if valid.
+def domain_failure_at(
+    points: Sequence[SamplePoint], index: int, count: int
+) -> Optional[ValidationFailure]:
+    """Domain-check the point at ``index`` within a sequence of ``count``.
 
-    Failures are located by sample index ascending.  Within a single index
-    the category priority is fixed: missing endpoint, non-monotonic
-    timestamp, ppm out of range, ppm precision exceeded.
+    Within one index the category priority is fixed: missing endpoint,
+    non-monotonic timestamp, ppm out of range, ppm precision exceeded.
+    """
+    point = points[index]
+    if index == 0 and point.timestamp != 0:
+        return ValidationFailure(
+            index=index,
+            category=CATEGORY_MISSING_ENDPOINT,
+            message=f"first timestamp must be 0, got {point.timestamp}",
+        )
+    if index == count - 1 and point.timestamp != TOTAL_SECONDS:
+        return ValidationFailure(
+            index=index,
+            category=CATEGORY_MISSING_ENDPOINT,
+            message=f"last timestamp must be {TOTAL_SECONDS}, got {point.timestamp}",
+        )
+    if index > 0 and point.timestamp <= points[index - 1].timestamp:
+        return ValidationFailure(
+            index=index,
+            category=CATEGORY_NON_MONOTONIC_TIMESTAMP,
+            message=(
+                f"timestamp {point.timestamp} is not strictly greater than "
+                f"previous timestamp {points[index - 1].timestamp}"
+            ),
+        )
+    if point.ppm < MIN_PPM or point.ppm > MAX_PPM:
+        return ValidationFailure(
+            index=index,
+            category=CATEGORY_PPM_OUT_OF_RANGE,
+            message=f"ppm {point.ppm} is outside the allowed range [0, 1000]",
+        )
+    if _decimal_places(point.ppm) > MAX_PPM_DECIMAL_PLACES:
+        return ValidationFailure(
+            index=index,
+            category=CATEGORY_PPM_PRECISION_EXCEEDED,
+            message=(
+                f"ppm {point.ppm} has more than "
+                f"{MAX_PPM_DECIMAL_PLACES} decimal places"
+            ),
+        )
+    return None
+
+
+def find_first_failure(points: Sequence[SamplePoint]) -> Optional[ValidationFailure]:
+    """Return the unique first domain failure, or ``None`` if valid.
+
+    Failures are located by sample index ascending.
     """
     count = len(points)
     if count == 0:
@@ -54,40 +109,10 @@ def find_first_failure(points: Sequence[SamplePoint]) -> Optional[ValidationFail
             category=CATEGORY_MISSING_ENDPOINT,
             message="sequence is empty: endpoints at timestamp 0 and 28800 are required",
         )
-    for index, point in enumerate(points):
-        if index == 0 and point.timestamp != 0:
-            return ValidationFailure(
-                index=index,
-                category=CATEGORY_MISSING_ENDPOINT,
-                message=f"first timestamp must be 0, got {point.timestamp}",
-            )
-        if index == count - 1 and point.timestamp != TOTAL_SECONDS:
-            return ValidationFailure(
-                index=index,
-                category=CATEGORY_MISSING_ENDPOINT,
-                message=f"last timestamp must be {TOTAL_SECONDS}, got {point.timestamp}",
-            )
-        if index > 0 and point.timestamp <= points[index - 1].timestamp:
-            return ValidationFailure(
-                index=index,
-                category=CATEGORY_NON_MONOTONIC_TIMESTAMP,
-                message=(
-                    f"timestamp {point.timestamp} is not strictly greater than "
-                    f"previous timestamp {points[index - 1].timestamp}"
-                ),
-            )
-        if point.ppm < MIN_PPM or point.ppm > MAX_PPM:
-            return ValidationFailure(
-                index=index,
-                category=CATEGORY_PPM_OUT_OF_RANGE,
-                message=f"ppm {point.ppm} is outside the allowed range [0, 1000]",
-            )
-        if _decimal_places(point.ppm) > MAX_PPM_DECIMAL_PLACES:
-            return ValidationFailure(
-                index=index,
-                category=CATEGORY_PPM_PRECISION_EXCEEDED,
-                message=f"ppm {point.ppm} has more than {MAX_PPM_DECIMAL_PLACES} decimal places",
-            )
+    for index in range(count):
+        failure = domain_failure_at(points, index, count)
+        if failure is not None:
+            return failure
     return None
 
 

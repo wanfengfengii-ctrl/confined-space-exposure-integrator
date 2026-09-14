@@ -61,18 +61,21 @@ verdict    = PASS  若 equivalent ≤ 25.000，否则 FAIL
 
 错误类别（`category`）：
 
-| category                  | 含义                              |
-| ------------------------- | --------------------------------- |
-| `missing_endpoint`        | 首点不是 0 或末点不是 28800       |
-| `non_monotonic_timestamp` | 时间戳重复或逆序（未严格递增）    |
-| `ppm_out_of_range`        | ppm 超出 `[0, 1000]`              |
-| `ppm_precision_exceeded`  | ppm 小数位超过三位                |
+| category                  | 含义                                                       |
+| ------------------------- | ---------------------------------------------------------- |
+| `invalid_type`            | 请求体或采样点结构/类型不合法（非数组、非对象、缺/多字段、非整数时间戳、非数值或非有限 ppm、JSON 无法解析） |
+| `missing_endpoint`        | 首点不是 0 或末点不是 28800                                |
+| `non_monotonic_timestamp` | 时间戳重复或逆序（未严格递增）                             |
+| `ppm_out_of_range`        | ppm 超出 `[0, 1000]`                                       |
+| `ppm_precision_exceeded`  | ppm 小数位超过三位                                         |
 
-**首错定位规则**：多个错误并存时，先按采样点索引升序定位；同一索引存在多类错误时，
-依次按 端点 → 时间递增 → ppm 范围 → ppm 精度 的优先级选择唯一首错。
+**首错定位规则**：多个错误并存时（含类型错误与领域错误混合），先按采样点索引升序
+定位；同一索引存在多类错误时，依次按 类型/结构 → 端点 → 时间递增 → ppm 范围 →
+ppm 精度 的优先级选择唯一首错。任何 422 响应都只有这一个错误信封，不会返回
+框架级的多项明细。
 
-类型层面的非法输入（如 `timestamp` 为 `1.5` 或字符串、`ppm` 为非数值、字段缺失或
-多出未知字段、请求体不是数组）同样整体返回 `422`。
+**精度按字面形式判定**：服务端以 `Decimal` 直接解析原始 JSON 数字，尾随零不会丢
+失——`12.3400` 虽数值等于 `12.34`，仍因四位小数被整批拒绝；`12.340` 则合法。
 
 ### `GET /healthz`
 
@@ -100,6 +103,12 @@ curl -X POST http://localhost:8000/adjudicate \
   -H 'Content-Type: application/json' \
   -d '[{"timestamp":0,"ppm":1},{"timestamp":100,"ppm":1}]'
 # => 422 {"error":{"index":1,"category":"missing_endpoint","message":"..."}}
+
+# 四位尾随小数 → 422（精度按字面形式判定）
+curl -X POST http://localhost:8000/adjudicate \
+  -H 'Content-Type: application/json' \
+  -d '[{"timestamp":0,"ppm":12.3400},{"timestamp":28800,"ppm":12.3400}]'
+# => 422 {"error":{"index":0,"category":"ppm_precision_exceeded","message":"..."}}
 ```
 
 ## 本地运行
@@ -143,12 +152,14 @@ docker compose up --exit-code-from verify verify
 
 ```
 app/
-  main.py    # FastAPI 应用、路由、422 错误信封
-  core.py    # 首错定位、梯形积分、等效值与裁决（纯 Decimal）
-  models.py  # Pydantic 请求/响应模型
+  main.py     # FastAPI 应用、路由、422 错误信封
+  parsing.py  # 原始 JSON 解码（保留字面精度）与单趟交错校验
+  core.py     # 领域校验、梯形积分、等效值与裁决（纯 Decimal）
+  models.py   # Pydantic 请求/响应模型
 tests/
-  test_core.py  # 积分、舍入、阈值与错误优先级单元测试
-  test_api.py   # HTTP 层契约测试
+  test_core.py     # 积分、舍入、阈值与错误优先级单元测试
+  test_parsing.py  # 解码与交错校验单元测试
+  test_api.py      # HTTP 层契约测试
 Dockerfile
 docker-compose.yml   # api 服务 + 一次性 verify 测试服务
 requirements.txt
@@ -158,6 +169,10 @@ requirements.txt
 
 - **十进制定点数**：所有积分与舍入均使用 `decimal.Decimal`，避免二进制浮点误差；
   面积最多四位小数，除以 28800 后按 `ROUND_HALF_UP` 精确落到三位小数。
+- **字面精度保留**：请求体由服务端以 `json.loads(parse_float=Decimal)` 自行解码，
+  JSON 数字不经过二进制浮点，`12.3400` 的四位小数对精度规则可见。
+- **单趟交错校验**：类型/结构校验与领域校验在同一趟索引升序扫描中交错进行，
+  因此任何 422 都是按索引定位的唯一首错，而非框架默认的多项明细。
 - **精确序列化**：响应中的 `area` 与 `equivalent` 以字符串返回，保留精确十进制
   表示（含末尾零，如 `"25.000"`），调用方可无损解析。
 - **先校验后计算**：任何校验失败都在积分之前整批拒绝，错误信封因此不可能泄漏
