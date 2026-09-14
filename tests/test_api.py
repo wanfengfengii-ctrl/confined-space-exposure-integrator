@@ -899,6 +899,206 @@ class TestDominantInterval:
         assert parameter["schema"]["default"] is False
 
 
+class TestLimitPpm:
+    """``limit_ppm`` optional site-specific adjudication limit."""
+
+    TWO_CROSSINGS_SEQUENCE = [
+        {"timestamp": 0, "ppm": 20},
+        {"timestamp": 10, "ppm": 30},
+        {"timestamp": 20, "ppm": 20},
+        {"timestamp": 28800, "ppm": 20},
+    ]
+
+    CONSTANT_30_SEQUENCE = [
+        {"timestamp": 0, "ppm": 30},
+        {"timestamp": 28800, "ppm": 30},
+    ]
+
+    def test_equivalent_at_custom_limit_passes_and_above_fails(self):
+        # Equivalent is exactly 30.000: at the limit it passes...
+        response = client.post(
+            "/adjudicate?limit_ppm=30", json=self.CONSTANT_30_SEQUENCE
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "area": "864000",
+            "equivalent": "30.000",
+            "verdict": "PASS",
+            "applied_limit": "30",
+        }
+        # ...while the same equivalent against a limit 0.001 lower fails.
+        response = client.post(
+            "/adjudicate?limit_ppm=29.999", json=self.CONSTANT_30_SEQUENCE
+        )
+        assert response.status_code == 200
+        assert response.json()["equivalent"] == "30.000"
+        assert response.json()["verdict"] == "FAIL"
+        assert response.json()["applied_limit"] == "29.999"
+        # Equivalent 30.001 also fails against the limit of 30.
+        response = client.post(
+            "/adjudicate?limit_ppm=30",
+            json=[{"timestamp": 0, "ppm": 30}, {"timestamp": 28800, "ppm": 30.002}],
+        )
+        assert response.status_code == 200
+        assert response.json()["equivalent"] == "30.001"
+        assert response.json()["verdict"] == "FAIL"
+
+    def test_same_sequence_flips_verdict_only_with_custom_limit(self):
+        response = client.post("/adjudicate", json=self.CONSTANT_30_SEQUENCE)
+        assert response.status_code == 200
+        assert response.json()["verdict"] == "FAIL"  # 30.000 > 25.000
+        assert "applied_limit" not in response.json()
+        response = client.post(
+            "/adjudicate?limit_ppm=30", json=self.CONSTANT_30_SEQUENCE
+        )
+        assert response.status_code == 200
+        assert response.json()["verdict"] == "PASS"
+
+    def test_exceedance_follows_limit_while_dominant_interval_is_unchanged(self):
+        url = "/adjudicate?include_exceedance=true&include_dominant_interval=true"
+        default = client.post(url, json=self.TWO_CROSSINGS_SEQUENCE)
+        custom = client.post(f"{url}&limit_ppm=22", json=self.TWO_CROSSINGS_SEQUENCE)
+        assert default.status_code == custom.status_code == 200
+        default_body = default.json()
+        custom_body = custom.json()
+        # Crossings move from 5/15 (limit 25.000) to 2/18 (limit 22).
+        assert default_body["exceedance"] == {
+            "total_seconds": "10",
+            "longest_segment": {
+                "start": "5",
+                "end": "15",
+                "duration_seconds": "10",
+            },
+        }
+        assert custom_body["exceedance"] == {
+            "total_seconds": "16",
+            "longest_segment": {
+                "start": "2",
+                "end": "18",
+                "duration_seconds": "16",
+            },
+        }
+        # Area attribution does not depend on the adjudication limit.
+        assert custom_body["dominant_interval"] == default_body["dominant_interval"]
+        assert custom_body["dominant_interval"] == {
+            "start": 20,
+            "end": 28800,
+            "area": "575600",
+            "percentage": "99.913",
+        }
+        # The limit is echoed only when supplied.
+        assert custom_body["applied_limit"] == "22"
+        assert "applied_limit" not in default_body
+
+    @pytest.mark.parametrize(
+        "bad_limit",
+        [
+            "abc",          # unparseable
+            "",             # empty
+            "1.5.2",        # unparseable
+            "NaN",          # non-finite
+            "Infinity",     # non-finite
+            "0",            # below the 0.001 minimum
+            "0.0009",       # below the minimum
+            "-5",           # negative
+            "1000.001",     # above the 1000 maximum
+            "1001",         # above the maximum
+            "25.0001",      # four decimal places
+            "0.0010",       # four lexical decimal places (trailing zero)
+            "12.3400",      # four lexical decimal places
+        ],
+    )
+    def test_invalid_limit_is_422_located_at_query_parameter(self, bad_limit):
+        # The body is itself invalid (ppm 2000 out of range at index 0), but
+        # the limit error must win: query parameters are validated before
+        # the request body is processed.
+        response = client.post(
+            f"/adjudicate?limit_ppm={bad_limit}",
+            json=[{"timestamp": 0, "ppm": 2000}, {"timestamp": 28800, "ppm": 1}],
+        )
+        assert response.status_code == 422
+        body = response.json()
+        assert set(body.keys()) == {"detail"}
+        detail = body["detail"]
+        assert isinstance(detail, list) and len(detail) == 1
+        assert detail[0]["loc"] == ["query", "limit_ppm"]
+        assert detail[0]["input"] == bad_limit
+        assert isinstance(detail[0]["type"], str) and detail[0]["type"]
+        assert isinstance(detail[0]["msg"], str) and detail[0]["msg"]
+        for forbidden in ("area", "equivalent", "verdict", "applied_limit"):
+            assert forbidden not in response.text
+
+    def test_invalid_limit_beats_unparseable_body(self):
+        # Even a body that is not JSON at all is never looked at when the
+        # limit is invalid.
+        response = client.post(
+            "/adjudicate?limit_ppm=abc",
+            content=b'[{"timestamp":0,',
+            headers=JSON_HEADERS,
+        )
+        assert response.status_code == 422
+        body = response.json()
+        assert set(body.keys()) == {"detail"}
+        assert body["detail"][0]["loc"] == ["query", "limit_ppm"]
+
+    def test_valid_limit_with_invalid_sequence_returns_domain_first_error(self):
+        response = client.post(
+            "/adjudicate?limit_ppm=30",
+            json=[
+                {"timestamp": 0, "ppm": 30},
+                {"timestamp": 100, "ppm": 2000},
+                {"timestamp": 28800, "ppm": 30},
+            ],
+        )
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 1, "ppm_out_of_range")
+        assert "applied_limit" not in response.text
+
+    @pytest.mark.parametrize(
+        "limit", ["0.001", "1000", "1000.000", "25", "25.000", "0.5"]
+    )
+    def test_boundary_and_three_decimal_limits_are_accepted(self, limit):
+        response = client.post(f"/adjudicate?limit_ppm={limit}", json=VALID_SEQUENCE)
+        assert response.status_code == 200
+        # The applied limit echoes the supplied lexical form.
+        assert response.json()["applied_limit"] == limit
+
+    def test_omitted_limit_keeps_response_shape_and_default_threshold(self):
+        response = client.post(
+            "/adjudicate?include_exceedance=true&include_dominant_interval=true",
+            json=[{"timestamp": 0, "ppm": 25}, {"timestamp": 28800, "ppm": 25}],
+        )
+        assert response.status_code == 200
+        body = response.json()
+        # Exactly the pre-limit fields; applied_limit appears only on demand.
+        assert set(body.keys()) == {
+            "area",
+            "equivalent",
+            "verdict",
+            "exceedance",
+            "dominant_interval",
+        }
+        assert body["equivalent"] == "25.000"
+        assert body["verdict"] == "PASS"
+        assert body["exceedance"] == {
+            "total_seconds": "0",
+            "longest_segment": None,
+        }
+        assert body["dominant_interval"] == {
+            "start": 0,
+            "end": 28800,
+            "area": "720000",
+            "percentage": "100.000",
+        }
+
+    def test_openapi_documents_optional_limit_query_parameter(self):
+        response = client.get("/openapi.json")
+        parameters = response.json()["paths"]["/adjudicate"]["post"]["parameters"]
+        [parameter] = [p for p in parameters if p["name"] == "limit_ppm"]
+        assert parameter["in"] == "query"
+        assert parameter["required"] is False
+
+
 class TestHealthAndDocs:
     def test_healthz(self):
         response = client.get("/healthz")

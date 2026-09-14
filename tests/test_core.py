@@ -94,6 +94,41 @@ class TestIntegration:
         assert integrate(seq) == expected == Decimal("21720.0")
 
 
+class TestAdjudicateWithCustomThreshold:
+    """The verdict follows the supplied threshold; area math never changes."""
+
+    def test_equivalent_exactly_at_custom_threshold_passes(self):
+        seq = points((0, "30"), (28800, "30"))
+        area, equivalent, verdict = adjudicate(seq, threshold=Decimal("30"))
+        assert area == Decimal("864000")
+        assert equivalent == Decimal("30.000")
+        assert verdict == "PASS"
+
+    def test_equivalent_just_above_custom_threshold_fails(self):
+        seq = points((0, "30"), (28800, "30"))
+        _, equivalent, verdict = adjudicate(seq, threshold=Decimal("29.999"))
+        assert equivalent == Decimal("30.000")
+        assert verdict == "FAIL"
+
+    def test_area_and_equivalent_do_not_depend_on_threshold(self):
+        seq = points((0, "0"), (100, "0"), (200, "100"), (28800, "0"))
+        assert adjudicate(seq, threshold=Decimal("60")) == (
+            Decimal("1435000"),
+            Decimal("49.826"),
+            "PASS",
+        )
+        assert adjudicate(seq, threshold=Decimal("49")) == (
+            Decimal("1435000"),
+            Decimal("49.826"),
+            "FAIL",
+        )
+
+    def test_default_threshold_remains_25(self):
+        seq = points((0, "30"), (28800, "30"))
+        assert adjudicate(seq)[2] == "FAIL"
+        assert adjudicate(seq, threshold=Decimal("30"))[2] == "PASS"
+
+
 class TestFindFirstFailure:
     def test_valid_sequence_passes(self):
         seq = points((0, "0"), (14400, "999.999"), (28800, "1000"))
@@ -356,6 +391,60 @@ class TestAnalyzeExceedance:
             format_seconds(summary.longest.end),
             format_seconds(summary.longest.duration),
         ) == ("3.333", "4.667", "1.333")
+
+
+class TestAnalyzeExceedanceWithCustomThreshold:
+    """The crossing analysis follows the supplied site limit."""
+
+    def test_crossings_move_with_the_custom_threshold(self):
+        # 20 -> 30 crosses 22 at t = 2; 30 -> 20 crosses back at t = 18.
+        seq = points((0, "20"), (10, "30"), (20, "20"), (28800, "20"))
+        summary = analyze_exceedance(seq, threshold=Decimal("22"))
+        assert (summary.longest.start, summary.longest.end) == (
+            Decimal("2"),
+            Decimal("18"),
+        )
+        assert summary.total_seconds == Decimal("16")
+
+    def test_default_threshold_still_crosses_at_25(self):
+        seq = points((0, "20"), (10, "30"), (20, "20"), (28800, "20"))
+        summary = analyze_exceedance(seq)
+        assert (summary.longest.start, summary.longest.end) == (
+            Decimal("5"),
+            Decimal("15"),
+        )
+        assert summary.total_seconds == Decimal("10")
+
+    def test_constantly_at_custom_threshold_is_not_an_exceedance(self):
+        summary = analyze_exceedance(
+            points((0, "22"), (28800, "22")), threshold=Decimal("22")
+        )
+        assert summary.total_seconds == Decimal("0")
+        assert summary.longest is None
+
+    def test_sample_touching_custom_threshold_separates_stretches(self):
+        # The sample at t=20 touches 22 exactly: two separate stretches.
+        seq = points(
+            (0, "20"),
+            (10, "24"),    # crosses 22 at t = 5
+            (20, "22"),    # touches the custom threshold exactly
+            (30, "24"),    # above again immediately
+            (50, "20"),    # crosses back at t = 40
+            (28800, "20"),
+        )
+        summary = analyze_exceedance(seq, threshold=Decimal("22"))
+        assert (summary.longest.start, summary.longest.end) == (
+            Decimal("20"),
+            Decimal("40"),
+        )
+        assert summary.total_seconds == Decimal("35")
+
+    def test_excursion_below_custom_threshold_disappears(self):
+        # The 20 -> 30 -> 20 bump exceeds 25 but never reaches 35.
+        seq = points((0, "20"), (10, "30"), (20, "20"), (28800, "20"))
+        summary = analyze_exceedance(seq, threshold=Decimal("35"))
+        assert summary.total_seconds == Decimal("0")
+        assert summary.longest is None
 
 
 class TestFindDominantInterval:

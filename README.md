@@ -2,8 +2,9 @@
 
 纯后端裁决服务：接收一条覆盖八小时（0–28800 秒）的气体浓度采样序列，使用**十进制定点
 数**对相邻采样点做梯形积分，得到时间加权等效值并对 25.000 ppm 阈值作出 PASS/FAIL
-裁决。采样间隔无需均匀——长时间高浓度区段会按其实际时长正确加权，而不会像
-"按采样条数求平均"那样被低估。
+裁决（不同作业许可也可通过 `limit_ppm` 查询参数指定更低的现场限值）。采样间隔无需
+均匀——长时间高浓度区段会按其实际时长正确加权，而不会像"按采样条数求平均"那样被
+低估。
 
 - 运行时：Python 3.12 · FastAPI · Pydantic v2 · pytest
 - 全部浓度计算使用 `decimal.Decimal`，等效值按 `ROUND_HALF_UP` 保留三位小数
@@ -15,7 +16,7 @@
 ```
 area       = Σ (pᵢ + pᵢ₊₁) × (tᵢ₊₁ − tᵢ) ÷ 2        （单位：ppm·秒，精确十进制）
 equivalent = ROUND_HALF_UP(area ÷ 28800, 3 位小数)
-verdict    = PASS  若 equivalent ≤ 25.000，否则 FAIL
+verdict    = PASS  若 equivalent ≤ 限值，否则 FAIL   （限值默认 25.000，可用 limit_ppm 覆盖）
 ```
 
 ## API 契约
@@ -39,8 +40,9 @@ verdict    = PASS  若 equivalent ≤ 25.000，否则 FAIL
 
 | 参数                        | 类型    | 默认   | 说明                                                                                                                                 |
 | --------------------------- | ------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `include_exceedance`        | 布尔量  | `false` | 为真时，在完成原有整批校验与裁决**之后**，把相邻采样点之间按线性变化处理，附加严格高于 `25.000` ppm 的超限分析（见下）。取值遵循 FastAPI 布尔解析：`true`/`1`/`yes`/`on`（大小写不敏感）为真，`false`/`0`/`no`/`off` 为假；无法解析时返回 `422`，错误定位于查询参数 `include_exceedance`。 |
+| `include_exceedance`        | 布尔量  | `false` | 为真时，在完成原有整批校验与裁决**之后**，把相邻采样点之间按线性变化处理，附加严格高于适用限值（默认 `25.000` ppm，或 `limit_ppm`）的超限分析（见下）。取值遵循 FastAPI 布尔解析：`true`/`1`/`yes`/`on`（大小写不敏感）为真，`false`/`0`/`no`/`off` 为假；无法解析时返回 `422`，错误定位于查询参数 `include_exceedance`。 |
 | `include_dominant_interval` | 布尔量  | `false` | 为真时，在完成整批校验与裁决**之后**，附加对总面积贡献最大的相邻采样点区间分析（见下）。布尔解析规则与 `include_exceedance` 相同；无法解析时返回 `422`，错误定位于查询参数 `include_dominant_interval`。 |
+| `limit_ppm`                 | 十进制数 | 无（即 `25.000`） | 现场限值：`0.001`–`1000`，最多三位小数（按字面形式判定，`12.3400` 因四位小数被拒）。提供时以该限值判定 PASS/FAIL，响应附带 `applied_limit` 供记录，`include_exceedance` 的穿越点、累计时长与最长区段也改用该限值。无法解析、越界或精度超限时返回 `422`，错误定位于查询参数 `limit_ppm`，且**在处理请求体之前**拒绝；限值合法而采样无效时仍按采样索引返回唯一首错。 |
 
 #### 合法响应 `200`
 
@@ -58,13 +60,28 @@ verdict    = PASS  若 equivalent ≤ 25.000，否则 FAIL
 - `equivalent`：三位小数的八小时等效值（字符串，如 `"25.000"`）
 - `verdict`：唯一裁决，`"PASS"` 或 `"FAIL"`
 
+提供 `limit_ppm` 时，响应额外附带 `applied_limit`，按所供字面十进制形式回显实际
+适用的限值（面积与等效值的计算规则不变，仅裁决限值改变）：
+
+```json
+{
+  "area": "864000",
+  "equivalent": "30.000",
+  "verdict": "PASS",
+  "applied_limit": "30"
+}
+```
+
+省略 `limit_ppm` 时响应不含 `applied_limit` 字段，裁决仍按 `25.000` ppm 判定。
+
 ##### `include_exceedance=true` 时附加的 `exceedance`
 
-相邻采样点之间视为线性浓度曲线，用 `Decimal` 求解浓度穿越 `25.000` ppm 的
-精确秒点（穿越秒点按 `ROUND_HALF_UP` 保留至多三位小数，即毫秒精度）：
+相邻采样点之间视为线性浓度曲线，用 `Decimal` 求解浓度穿越适用限值（默认
+`25.000` ppm；提供 `limit_ppm` 时为该限值）的精确秒点（穿越秒点按
+`ROUND_HALF_UP` 保留至多三位小数，即毫秒精度）：
 
 ```
-t_cross = t_i + (25.000 − ppm_i) ÷ (ppm_i+1 − ppm_i) × (t_i+1 − t_i)
+t_cross = t_i + (限值 − ppm_i) ÷ (ppm_i+1 − ppm_i) × (t_i+1 − t_i)
 ```
 
 **舍入只发生在输出边界**：穿越秒点、区段时长与总时长在内部一律保留高精度
@@ -126,8 +143,8 @@ Decimal 精确值，仅在序列化时对每个输出值单独 `ROUND_HALF_UP` �
   字符串表示；总面积为零时固定返回 `"0.000"`
 
 > 与超限分析相同，主导区间分析是纯粹的附加结果：只在整批校验与裁决完成之后
-> 运行，不参与也不改变 PASS/FAIL 裁决与超限分析；省略或关闭参数时响应与
-> 既有版本逐字段一致。
+> 运行，不参与也不改变 PASS/FAIL 裁决与超限分析；其面积归因不受 `limit_ppm`
+> 影响，省略或关闭参数时响应与既有版本逐字段一致。
 
 #### 校验失败响应 `422`
 
@@ -158,8 +175,14 @@ Decimal 精确值，仅在序列化时对每个输出值单独 `ROUND_HALF_UP` �
 ppm 精度 的优先级选择唯一首错。任何 422 响应都只有这一个错误信封，不会返回
 框架级的多项明细。
 
+**查询参数错误优先于请求体**：`limit_ppm` 无法解析、越界或精度超限时，由框架在
+处理请求体**之前**返回 `422`，错误定位于查询参数（形如
+`{"detail":[{"type":...,"loc":["query","limit_ppm"],...}]}`，与布尔参数无法解析
+时的信封一致）；限值合法而采样序列无效时，仍返回上述唯一首错信封。
+
 **精度按字面形式判定**：服务端以 `Decimal` 直接解析原始 JSON 数字，尾随零不会丢
 失——`12.3400` 虽数值等于 `12.34`，仍因四位小数被整批拒绝；`12.340` 则合法。
+`limit_ppm` 的精度规则与此相同。
 
 ### `GET /healthz`
 
@@ -212,6 +235,21 @@ curl -X POST 'http://localhost:8000/adjudicate?include_exceedance=maybe' \
   -H 'Content-Type: application/json' -d '[]'
 # => 422 {"detail":[{"type":"bool_parsing",
 #       "loc":["query","include_exceedance"], ...}]}
+
+# 现场限值：同一份采样按 limit_ppm=30 裁决，等效值 30.000 恰好达标 → PASS，
+# 响应附带 applied_limit 供记录
+curl -X POST 'http://localhost:8000/adjudicate?limit_ppm=30' \
+  -H 'Content-Type: application/json' \
+  -d '[{"timestamp":0,"ppm":30},{"timestamp":28800,"ppm":30}]'
+# => {"area":"864000","equivalent":"30.000","verdict":"PASS",
+#     "applied_limit":"30"}
+
+# 非法限值 → 422，定位于查询参数 limit_ppm，且先于请求体处理
+curl -X POST 'http://localhost:8000/adjudicate?limit_ppm=25.0001' \
+  -H 'Content-Type: application/json' \
+  -d '[{"timestamp":0,"ppm":1},{"timestamp":28800,"ppm":1}]'
+# => 422 {"detail":[{"type":"value_error",
+#       "loc":["query","limit_ppm"], ...}]}
 
 # 四位尾随小数 → 422（精度按字面形式判定）
 curl -X POST http://localhost:8000/adjudicate \
@@ -296,3 +334,8 @@ requirements.txt
   与裁决完成后，复用逐段 `Decimal` 梯形面积选出对总面积贡献最大的相邻点区间
   （面积并列取起点最早者）；百分比按 `ROUND_HALF_UP` 保留三位，总面积为零时
   固定 `"0.000"`。该分析同样不参与裁决，省略参数时响应逐字段保持现状。
+- **现场限值按需覆盖**：`limit_ppm` 查询参数接受 `0.001`–`1000`、最多三位小数的
+  十进制限值（精度按字面形式判定）。框架在读取请求体之前完成限值校验，非法限值
+  以定位于 `limit_ppm` 的 422 拒绝；合法限值下面积与等效值计算规则不变，仅
+  PASS/FAIL 裁决与超限分析改用该限值，响应附带 `applied_limit` 供记录，主导区间
+  的面积归因不受影响。省略参数时响应字段、`25.000` 判定与两个分析选项保持原样。

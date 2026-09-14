@@ -1,18 +1,23 @@
 """FastAPI application exposing the eight-hour gas adjudication endpoint."""
 
 from decimal import Decimal
-from typing import Optional, Sequence
+from typing import Annotated, Optional, Sequence
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import AfterValidator
 
 from .core import (
     CATEGORY_INVALID_TYPE,
+    MAX_LIMIT,
+    MIN_LIMIT,
+    PASS_THRESHOLD,
     DomainValidationError,
     ValidationFailure,
     adjudicate,
     analyze_exceedance,
     area_share_percent,
+    check_limit_precision,
     find_dominant_interval,
     format_seconds,
 )
@@ -26,6 +31,12 @@ from .models import (
 )
 from .parsing import decode_json_body, validate_sequence
 
+# A site-specific adjudication limit: decimal, 0.001-1000, at most three
+# decimal places judged on the lexical form.  Range and non-finite failures
+# come from the Query constraints below; the lexical precision rule needs
+# the parsed Decimal's exponent, so it runs as a type-level validator.
+LimitPpm = Annotated[Decimal, AfterValidator(check_limit_precision)]
+
 app = FastAPI(
     title="Confined-Space Gas Adjudication API",
     version="1.0.0",
@@ -34,7 +45,8 @@ app = FastAPI(
         "Accepts one JSON sampling sequence covering an eight-hour window, "
         "integrates it trapezoidally with decimal fixed-point arithmetic, "
         "and returns the raw area, the three-decimal equivalent value, and "
-        "a PASS/FAIL verdict against the 25.000 ppm threshold."
+        "a PASS/FAIL verdict against the 25.000 ppm threshold (or an "
+        "optional site-specific limit_ppm)."
     ),
 )
 
@@ -105,8 +117,8 @@ async def adjudicate_sequence(
     include_exceedance: bool = Query(
         default=False,
         description=(
-            "Attach the strictly-above-25.000 ppm exceedance analysis "
-            "to the response."
+            "Attach the strictly-above-threshold exceedance analysis "
+            "(25.000 ppm, or limit_ppm when supplied) to the response."
         ),
     ),
     include_dominant_interval: bool = Query(
@@ -116,9 +128,24 @@ async def adjudicate_sequence(
             "to the total area."
         ),
     ),
+    limit_ppm: Optional[LimitPpm] = Query(
+        default=None,
+        ge=MIN_LIMIT,
+        le=MAX_LIMIT,
+        description=(
+            "Site-specific adjudication limit in ppm (0.001-1000, at most "
+            "three decimal places). When present, the PASS/FAIL verdict and "
+            "the exceedance analysis use this limit instead of 25.000, and "
+            "the response echoes it as applied_limit. Unparseable, "
+            "out-of-range, or over-precise values are rejected with a 422 "
+            "located at this query parameter before the body is processed."
+        ),
+    ),
 ) -> AdjudicationResult:
     # The contract is a single JSON sampling sequence; anything submitted
     # without a JSON media type is rejected before any parsing happens.
+    # (An invalid limit_ppm never reaches this point: the framework
+    # validates query parameters before the body is read.)
     if not _is_json_content_type(request.headers.get("content-type")):
         raise DomainValidationError(
             ValidationFailure(
@@ -135,20 +162,27 @@ async def adjudicate_sequence(
     # flow; the exceedance and dominant-interval analyses run only after both
     # have succeeded, so a failure here can never leak area, equivalent, or
     # verdict — a bad batch still returns its single first-failure envelope.
-    area, equivalent, verdict = adjudicate(points)
+    threshold = limit_ppm if limit_ppm is not None else PASS_THRESHOLD
+    area, equivalent, verdict = adjudicate(points, threshold)
     result = AdjudicationResult(
         area=str(area), equivalent=str(equivalent), verdict=verdict
     )
+    if limit_ppm is not None:
+        # Echo the applied limit for the record; "f" keeps the lexical
+        # decimal places without scientific notation.
+        result.applied_limit = format(limit_ppm, "f")
     if include_exceedance:
-        result.exceedance = _build_exceedance(points)
+        result.exceedance = _build_exceedance(points, threshold)
     if include_dominant_interval:
         result.dominant_interval = _build_dominant_interval(points, area)
     return result
 
 
-def _build_exceedance(points: Sequence[SamplePoint]) -> Exceedance:
+def _build_exceedance(
+    points: Sequence[SamplePoint], threshold: Decimal
+) -> Exceedance:
     """Run the crossing analysis and map it to the wire model."""
-    summary = analyze_exceedance(points)
+    summary = analyze_exceedance(points, threshold)
     longest = None
     if summary.longest is not None:
         longest = ExceedanceSegment(

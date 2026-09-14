@@ -15,6 +15,12 @@ MIN_PPM = Decimal("0")
 MAX_PPM = Decimal("1000")
 MAX_PPM_DECIMAL_PLACES = 3
 PASS_THRESHOLD = Decimal("25.000")
+# Site-specific adjudication limits (the optional limit_ppm query parameter)
+# follow the per-sample ppm rules: decimal fixed-point with at most three
+# lexical decimal places; the accepted range is 0.001-1000 inclusive.
+MIN_LIMIT = Decimal("0.001")
+MAX_LIMIT = Decimal("1000")
+MAX_LIMIT_DECIMAL_PLACES = 3
 EQUIVALENT_QUANTUM = Decimal("0.001")
 SECOND_QUANTUM = Decimal("0.001")
 PERCENT_QUANTUM = Decimal("0.001")
@@ -52,8 +58,8 @@ class ExceedanceSegment:
     """One maximal contiguous stretch strictly above the threshold.
 
     ``start``/``end`` are seconds since window start; the concentration is
-    strictly above ``PASS_THRESHOLD`` on the open interval ``(start, end)``,
-    touching the threshold exactly at both endpoints.
+    strictly above the applicable threshold on the open interval
+    ``(start, end)``, touching the threshold exactly at both endpoints.
     """
 
     start: Decimal
@@ -98,6 +104,22 @@ def _decimal_places(value: Decimal) -> int:
     """Number of fractional decimal places of a finite Decimal."""
     exponent = value.as_tuple().exponent
     return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+def check_limit_precision(limit: Decimal) -> Decimal:
+    """Return ``limit`` unchanged, rejecting over-precise lexical forms.
+
+    Plugged into the ``limit_ppm`` query-parameter validator, so an
+    over-precise limit is refused before the request body is even read.
+    Precision is judged on the lexical form exactly like the per-sample
+    ppm rule: ``12.3400`` is rejected even though it equals ``12.34``.
+    """
+    if _decimal_places(limit) > MAX_LIMIT_DECIMAL_PLACES:
+        raise ValueError(
+            f"limit_ppm {limit} has more than "
+            f"{MAX_LIMIT_DECIMAL_PLACES} decimal places"
+        )
+    return limit
 
 
 def domain_failure_at(
@@ -193,11 +215,18 @@ def equivalent_value(area: Decimal) -> Decimal:
     return (area / TOTAL_SECONDS).quantize(EQUIVALENT_QUANTUM, rounding=ROUND_HALF_UP)
 
 
-def adjudicate(points: Sequence[SamplePoint]) -> tuple[Decimal, Decimal, Verdict]:
-    """Compute ``(raw_area, equivalent, verdict)`` for a valid sequence."""
+def adjudicate(
+    points: Sequence[SamplePoint], threshold: Decimal = PASS_THRESHOLD
+) -> tuple[Decimal, Decimal, Verdict]:
+    """Compute ``(raw_area, equivalent, verdict)`` for a valid sequence.
+
+    The verdict compares the three-decimal equivalent against ``threshold``
+    — the shared 25.000 ppm default, or a site-specific limit supplied as
+    the ``limit_ppm`` query parameter.
+    """
     area = integrate(points)
     equivalent = equivalent_value(area)
-    verdict: Verdict = "PASS" if equivalent <= PASS_THRESHOLD else "FAIL"
+    verdict: Verdict = "PASS" if equivalent <= threshold else "FAIL"
     return area, equivalent, verdict
 
 
@@ -245,8 +274,10 @@ def format_seconds(value: Decimal) -> str:
     return text or "0"
 
 
-def analyze_exceedance(points: Sequence[SamplePoint]) -> ExceedanceSummary:
-    """Summarize time spent strictly above ``PASS_THRESHOLD`` ppm.
+def analyze_exceedance(
+    points: Sequence[SamplePoint], threshold: Decimal = PASS_THRESHOLD
+) -> ExceedanceSummary:
+    """Summarize time spent strictly above ``threshold`` ppm.
 
     Adjacent samples are treated as a piecewise-linear concentration curve;
     the crossing second within a segment from ``(t0, p0)`` to ``(t1, p1)``
@@ -260,11 +291,13 @@ def analyze_exceedance(points: Sequence[SamplePoint]) -> ExceedanceSummary:
     earliest segment.  A curve that only ever equals (never exceeds) the
     threshold yields a zero total and ``longest=None``.
 
-    Crossing seconds and durations are kept as high-precision Decimals
-    internally; rounding to millisecond resolution happens only in
-    :func:`format_seconds` at serialization time, so rounding individual
-    endpoints never inflates the reported durations (which three short
-    excursions would otherwise turn into 4.002 s instead of 4 s).
+    ``threshold`` is the shared 25.000 ppm default unless a site-specific
+    ``limit_ppm`` was supplied.  Crossing seconds and durations are kept as
+    high-precision Decimals internally; rounding to millisecond resolution
+    happens only in :func:`format_seconds` at serialization time, so
+    rounding individual endpoints never inflates the reported durations
+    (which three short excursions would otherwise turn into 4.002 s
+    instead of 4 s).
     """
     with localcontext() as context:
         context.prec = ANALYSIS_PRECISION
@@ -274,12 +307,12 @@ def analyze_exceedance(points: Sequence[SamplePoint]) -> ExceedanceSummary:
             t1 = Decimal(current.timestamp)
             p0 = previous.ppm
             p1 = current.ppm
-            above0 = p0 > PASS_THRESHOLD
-            above1 = p1 > PASS_THRESHOLD
+            above0 = p0 > threshold
+            above1 = p1 > threshold
             if above0 and above1:
                 intervals.append((t0, t1, index))
             elif above0 or above1:
-                crossing = t0 + (PASS_THRESHOLD - p0) / (p1 - p0) * (
+                crossing = t0 + (threshold - p0) / (p1 - p0) * (
                     t1 - t0
                 )
                 intervals.append(
@@ -293,8 +326,8 @@ def analyze_exceedance(points: Sequence[SamplePoint]) -> ExceedanceSummary:
                 and start == segments[-1].end
                 # Only stretches sharing a sample that is itself strictly
                 # above the threshold are one continuous exceedance; a
-                # sample touching 25.000 exactly separates them.
-                and points[index].ppm > PASS_THRESHOLD
+                # sample touching the threshold exactly separates them.
+                and points[index].ppm > threshold
             ):
                 segments[-1] = ExceedanceSegment(segments[-1].start, end)
             else:

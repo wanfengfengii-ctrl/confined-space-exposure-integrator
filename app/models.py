@@ -22,10 +22,12 @@ class SamplePoint(BaseModel):
 
 
 class ExceedanceSegment(BaseModel):
-    """One maximal contiguous stretch strictly above 25.000 ppm.
+    """One maximal contiguous stretch strictly above the applicable threshold.
 
-    Seconds are strings with at most three decimal places so fractional
-    crossing points keep their exact millisecond resolution.
+    The threshold is 25.000 ppm by default, or the ``limit_ppm`` query
+    parameter when supplied.  Seconds are strings with at most three decimal
+    places so fractional crossing points keep their exact millisecond
+    resolution.
     """
 
     start: str
@@ -66,15 +68,18 @@ class AdjudicationResult(BaseModel):
 
     ``area`` and ``equivalent`` are serialized as strings so the exact
     decimal representation (including trailing zeros) survives the round
-    trip without binary floating-point noise.  ``exceedance`` is populated
-    only for ``include_exceedance=true`` requests and ``dominant_interval``
-    only for ``include_dominant_interval=true`` requests; each field is
-    omitted entirely otherwise.
+    trip without binary floating-point noise.  ``applied_limit`` echoes the
+    site-specific ``limit_ppm`` query parameter and is populated only when
+    that parameter is present.  ``exceedance`` is populated only for
+    ``include_exceedance=true`` requests and ``dominant_interval`` only for
+    ``include_dominant_interval=true`` requests; each field is omitted
+    entirely otherwise.
     """
 
     area: str
     equivalent: str
     verdict: Literal["PASS", "FAIL"]
+    applied_limit: Optional[str] = None
     exceedance: Optional[Exceedance] = None
     dominant_interval: Optional[DominantInterval] = None
 
