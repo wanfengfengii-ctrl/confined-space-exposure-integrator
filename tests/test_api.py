@@ -392,11 +392,14 @@ class TestExceedance:
         )
         assert response.status_code == 200
         segment = response.json()["exceedance"]["longest_segment"]
+        # Exact span is 10/3 s; it must serialize as 3.333, not be inflated
+        # to 3.334 by rounding both endpoints before subtracting.
         assert segment == {
             "start": "8.333",
             "end": "11.667",
-            "duration_seconds": "3.334",
+            "duration_seconds": "3.333",
         }
+        assert response.json()["exceedance"]["total_seconds"] == "3.333"
 
     def test_contiguous_stretch_merges_across_several_segments(self):
         response = client.post(
@@ -435,12 +438,43 @@ class TestExceedance:
             ],
         )
         assert response.status_code == 200
+        # Both excursions truly last 10/3 s; their rounded endpoints must not
+        # inflate either duration (3.333, not 3.334) or the total (6.667,
+        # not 6.668), and the earliest excursion still wins the tie.
         assert response.json()["exceedance"] == {
-            "total_seconds": "6.668",
+            "total_seconds": "6.667",
             "longest_segment": {
                 "start": "8.333",
                 "end": "11.667",
-                "duration_seconds": "3.334",
+                "duration_seconds": "3.333",
+            },
+        }
+
+    def test_three_short_excursions_do_not_accumulate_rounding_error(self):
+        # Each triangular excursion is genuinely 4/3 s; the exact total is
+        # 4 s. Endpoint rounding must never surface as 4.002 s.
+        response = client.post(
+            "/adjudicate?include_exceedance=true",
+            json=[
+                {"timestamp": 0, "ppm": 0},
+                {"timestamp": 4, "ppm": 30},
+                {"timestamp": 8, "ppm": 0},
+                {"timestamp": 20, "ppm": 0},
+                {"timestamp": 24, "ppm": 30},
+                {"timestamp": 28, "ppm": 0},
+                {"timestamp": 40, "ppm": 0},
+                {"timestamp": 44, "ppm": 30},
+                {"timestamp": 48, "ppm": 0},
+                {"timestamp": 28800, "ppm": 0},
+            ],
+        )
+        assert response.status_code == 200
+        assert response.json()["exceedance"] == {
+            "total_seconds": "4",
+            "longest_segment": {
+                "start": "3.333",
+                "end": "4.667",
+                "duration_seconds": "1.333",
             },
         }
 

@@ -22,6 +22,11 @@ def points(*pairs: tuple[int, str]) -> list[SamplePoint]:
     return [SamplePoint(timestamp=ts, ppm=ppm) for ts, ppm in pairs]
 
 
+def close(actual: Decimal, expected: Decimal, tolerance=Decimal("1e-20")) -> bool:
+    """Compare rationals whose decimal tails differ only by working precision."""
+    return abs(actual - expected) <= tolerance
+
+
 class TestIntegration:
     def test_constant_sequence(self):
         seq = points((0, "10"), (14400, "10"), (28800, "10"))
@@ -207,15 +212,17 @@ class TestAnalyzeExceedance:
         assert summary.total_seconds == Decimal("3.0")
 
     def test_fractional_crossing_rounds_half_up_to_milliseconds(self):
-        # Ramp 24 -> 27 over 10 s: crossing at (1/3)*10 = 3.3333... -> 3.333.
-        # The long descent 27 -> 0 over 28790 s crosses at 10 + 2/27*28790.
+        # Ramp 24 -> 27 over 10 s: crossing at (1/3)*10 = 3.3333...; the long
+        # descent 27 -> 0 over 28790 s crosses at 10 + 2/27*28790.
         seq = points((0, "24"), (10, "27"), (28800, "0"))
         summary = analyze_exceedance(seq)
+        start = Decimal("10") / Decimal("3")
         end = Decimal("10") + Decimal("2") * Decimal("28790") / Decimal("27")
-        end = end.quantize(Decimal("0.001"))
-        assert summary.longest.start == Decimal("3.333")
-        assert summary.longest.end == end
-        assert summary.total_seconds == end - Decimal("3.333")
+        assert close(summary.longest.start, start)
+        assert close(summary.longest.end, end)
+        assert close(summary.total_seconds, end - start)
+        # Serialization rounds each exact value independently.
+        assert format_seconds(summary.longest.start) == "3.333"
 
     def test_contiguous_above_segments_merge_across_sample_points(self):
         # Three above-threshold samples joined by above-threshold sample
@@ -238,21 +245,30 @@ class TestAnalyzeExceedance:
         assert summary.total_seconds == Decimal("15.000")
 
     def test_multiple_separate_segments_with_tie_returns_earliest(self):
-        # Two equal triangular excursions: each rounds to 3.334 s, so the
-        # earliest one must be reported.
+        # Two equal triangular excursions with fractional crossing points;
+        # durations tie exactly at 10/3 s, so the earliest must win without
+        # any rounding deciding it.
         seq = points(
             (0, "0"),
-            (10, "30"),    # crosses up at 8.333
-            (20, "0"),     # crosses down at 11.667
+            (10, "30"),    # crosses up at 25/3
+            (20, "0"),     # crosses down at 35/3
             (100, "0"),
-            (110, "30"),   # crosses up at 108.333
-            (120, "0"),    # crosses down at 111.667
+            (110, "30"),   # crosses up at 100 + 25/3
+            (120, "0"),    # crosses down at 100 + 35/3
             (28800, "0"),
         )
         summary = analyze_exceedance(seq)
-        assert summary.longest.start == Decimal("8.333")
-        assert summary.longest.end == Decimal("11.667")
-        assert summary.total_seconds == Decimal("6.668")
+        assert close(summary.longest.start, Decimal(25) / Decimal(3))
+        assert close(summary.longest.end, Decimal(35) / Decimal(3))
+        assert close(summary.longest.duration, Decimal(10) / Decimal(3))
+        assert close(summary.total_seconds, Decimal(20) / Decimal(3))
+        # Serialized independently at the wire boundary.
+        assert (
+            format_seconds(summary.longest.start),
+            format_seconds(summary.longest.end),
+            format_seconds(summary.longest.duration),
+            format_seconds(summary.total_seconds),
+        ) == ("8.333", "11.667", "3.333", "6.667")
 
     def test_exact_tie_keeps_earliest_segment(self):
         # Exactly equal 4 s excursions at integer crossings: tie broken by
@@ -281,11 +297,13 @@ class TestAnalyzeExceedance:
             (28800, "0"),
         )
         summary = analyze_exceedance(seq)
-        # First stretch 8.333 -> 20 (11.667 s); second 20 -> 32.5 (12.5 s),
-        # so the second wins, and the threshold point stayed a boundary.
+        # First stretch: 25/3 -> 20 (35/3 s); second: 20 -> 32.5 (12.5 s).
+        # The second is longer, and the threshold-touching sample at t=20
+        # stays a boundary. Internal values stay exact.
         assert summary.longest.start == Decimal("20")
         assert summary.longest.end == Decimal("32.5")
-        assert summary.total_seconds == Decimal("24.167")
+        assert close(summary.total_seconds, Decimal("145") / Decimal("6"))
+        assert format_seconds(summary.total_seconds) == "24.167"
 
     def test_always_equal_to_threshold_is_not_an_exceedance(self):
         seq = points((0, "25"), (14400, "25.000"), (28800, "25"))
@@ -314,6 +332,28 @@ class TestAnalyzeExceedance:
         assert summary.longest.start == Decimal("0")
         assert summary.longest.end == Decimal("5")
         assert summary.total_seconds == Decimal("5")
+
+    def test_three_short_excursions_total_is_not_rounded_up(self):
+        # Regression: each triangular excursion truly lasts 4/3 s
+        # (0->30 over 4 s crosses at 10/3, 30->0 over 4 s at 14/3).
+        # Rounding each crossing before subtracting inflated every span to
+        # 1.334 s and reported 4.002 s for three excursions; the exact total
+        # is 4 s and must serialize as "4".
+        seq = points(
+            (0, "0"), (4, "30"), (8, "0"),
+            (20, "0"), (24, "30"), (28, "0"),
+            (40, "0"), (44, "30"), (48, "0"),
+            (28800, "0"),
+        )
+        summary = analyze_exceedance(seq)
+        assert close(summary.total_seconds, Decimal("4"))
+        assert format_seconds(summary.total_seconds) == "4"
+        assert close(summary.longest.duration, Decimal(4) / Decimal(3))
+        assert (
+            format_seconds(summary.longest.start),
+            format_seconds(summary.longest.end),
+            format_seconds(summary.longest.duration),
+        ) == ("3.333", "4.667", "1.333")
 
 
 class TestFormatSeconds:

@@ -5,7 +5,7 @@ base-10 fixed-point values, never binary floating-point approximations.
 """
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Literal, Optional, Sequence
 
 from .models import SamplePoint
@@ -17,6 +17,16 @@ MAX_PPM_DECIMAL_PLACES = 3
 PASS_THRESHOLD = Decimal("25.000")
 EQUIVALENT_QUANTUM = Decimal("0.001")
 SECOND_QUANTUM = Decimal("0.001")
+# Working precision for the crossing analysis and the tolerance used to tell
+# genuinely different segment durations apart.  Inputs carry 3-decimal ppm
+# and integer seconds; at 40-digit precision the accumulated division tail
+# over a maximal 28801-point window stays below 1e-30 s, while two distinct
+# single-crossing durations differ by at least 1e-12 s.  Durations closer
+# than 1e-18 s are therefore exact ties as far as any millisecond-resolution
+# consumer can observe, and the earliest one wins; strict comparison would
+# instead let a 1e-30 division tail decide between identical excursions.
+ANALYSIS_PRECISION = 40
+DURATION_EPSILON = Decimal("0.000000000000000001")
 
 CATEGORY_INVALID_TYPE = "invalid_type"
 CATEGORY_MISSING_ENDPOINT = "missing_endpoint"
@@ -196,49 +206,55 @@ def analyze_exceedance(points: Sequence[SamplePoint]) -> ExceedanceSummary:
     strictly-above duration and the longest segment; ties resolve to the
     earliest segment.  A curve that only ever equals (never exceeds) the
     threshold yields a zero total and ``longest=None``.
+
+    Crossing seconds and durations are kept as high-precision Decimals
+    internally; rounding to millisecond resolution happens only in
+    :func:`format_seconds` at serialization time, so rounding individual
+    endpoints never inflates the reported durations (which three short
+    excursions would otherwise turn into 4.002 s instead of 4 s).
     """
-    intervals: list[tuple[Decimal, Decimal, int]] = []
-    for index, (previous, current) in enumerate(zip(points, points[1:])):
-        t0 = Decimal(previous.timestamp)
-        t1 = Decimal(current.timestamp)
-        p0 = previous.ppm
-        p1 = current.ppm
-        above0 = p0 > PASS_THRESHOLD
-        above1 = p1 > PASS_THRESHOLD
-        if above0 and above1:
-            intervals.append((t0, t1, index))
-        elif above0 or above1:
-            crossing = t0 + (PASS_THRESHOLD - p0) / (p1 - p0) * (t1 - t0)
-            # Crossings are reported at millisecond resolution; quantize once
-            # here so every derived figure (duration, total) stays consistent
-            # with the serialized endpoints.
-            crossing = crossing.quantize(SECOND_QUANTUM, rounding=ROUND_HALF_UP)
-            intervals.append(
-                (t0, crossing, index) if above0 else (crossing, t1, index)
-            )
+    with localcontext() as context:
+        context.prec = ANALYSIS_PRECISION
+        intervals: list[tuple[Decimal, Decimal, int]] = []
+        for index, (previous, current) in enumerate(zip(points, points[1:])):
+            t0 = Decimal(previous.timestamp)
+            t1 = Decimal(current.timestamp)
+            p0 = previous.ppm
+            p1 = current.ppm
+            above0 = p0 > PASS_THRESHOLD
+            above1 = p1 > PASS_THRESHOLD
+            if above0 and above1:
+                intervals.append((t0, t1, index))
+            elif above0 or above1:
+                crossing = t0 + (PASS_THRESHOLD - p0) / (p1 - p0) * (
+                    t1 - t0
+                )
+                intervals.append(
+                    (t0, crossing, index) if above0 else (crossing, t1, index)
+                )
 
-    segments: list[ExceedanceSegment] = []
-    for start, end, index in intervals:
-        # Quantization can collapse a sub-millisecond excursion to zero
-        # length; such an excursion contributes nothing and must not become
-        # the longest segment.
-        if start >= end:
-            continue
-        if (
-            segments
-            and start == segments[-1].end
-            # Only stretches sharing a sample that is itself strictly above
-            # the threshold are one continuous exceedance; a sample touching
-            # 25.000 exactly separates the stretches on either side.
-            and points[index].ppm > PASS_THRESHOLD
-        ):
-            segments[-1] = ExceedanceSegment(segments[-1].start, end)
-        else:
-            segments.append(ExceedanceSegment(start, end))
+        segments: list[ExceedanceSegment] = []
+        for start, end, index in intervals:
+            if (
+                segments
+                and start == segments[-1].end
+                # Only stretches sharing a sample that is itself strictly
+                # above the threshold are one continuous exceedance; a
+                # sample touching 25.000 exactly separates them.
+                and points[index].ppm > PASS_THRESHOLD
+            ):
+                segments[-1] = ExceedanceSegment(segments[-1].start, end)
+            else:
+                segments.append(ExceedanceSegment(start, end))
 
-    total = sum((segment.duration for segment in segments), Decimal("0"))
-    longest: Optional[ExceedanceSegment] = None
-    for segment in segments:
-        if longest is None or segment.duration > longest.duration:
-            longest = segment
-    return ExceedanceSummary(total_seconds=total, longest=longest)
+        total = sum((segment.duration for segment in segments), Decimal("0"))
+        longest: Optional[ExceedanceSegment] = None
+        for segment in segments:
+            # Durations that differ only by a division tail (well under a
+            # nanosecond) are ties; a strict-greater comparison here would
+            # otherwise pick the "longer" of identical excursions.
+            if longest is None or segment.duration > longest.duration + (
+                DURATION_EPSILON
+            ):
+                longest = segment
+        return ExceedanceSummary(total_seconds=total, longest=longest)
