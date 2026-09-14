@@ -5,7 +5,7 @@ from typing import Annotated, Optional, Sequence
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import AfterValidator
+from pydantic import AfterValidator, BeforeValidator
 
 from .core import (
     CATEGORY_INVALID_TYPE,
@@ -18,6 +18,7 @@ from .core import (
     analyze_exceedance,
     area_share_percent,
     check_limit_precision,
+    check_limit_syntax,
     find_dominant_interval,
     format_seconds,
 )
@@ -31,11 +32,17 @@ from .models import (
 )
 from .parsing import decode_json_body, validate_sequence
 
-# A site-specific adjudication limit: decimal, 0.001-1000, at most three
-# decimal places judged on the lexical form.  Range and non-finite failures
-# come from the Query constraints below; the lexical precision rule needs
-# the parsed Decimal's exponent, so it runs as a type-level validator.
-LimitPpm = Annotated[Decimal, AfterValidator(check_limit_precision)]
+# A site-specific adjudication limit: plain decimal literal, 0.001-1000, at
+# most three decimal places judged on the lexical form.  The syntax gate
+# runs first (Decimal itself would silently accept "1_00" or Unicode
+# digits), then range and non-finite failures come from the Query
+# constraints below, and the lexical precision rule checks the parsed
+# Decimal's exponent.
+LimitPpm = Annotated[
+    Decimal,
+    BeforeValidator(check_limit_syntax),
+    AfterValidator(check_limit_precision),
+]
 
 app = FastAPI(
     title="Confined-Space Gas Adjudication API",

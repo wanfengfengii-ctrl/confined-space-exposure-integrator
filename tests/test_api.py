@@ -998,6 +998,12 @@ class TestLimitPpm:
             "1.5.2",        # unparseable
             "NaN",          # non-finite
             "Infinity",     # non-finite
+            "1_00",         # underscores are not plain decimal syntax
+            "1_000",        # underscores, would otherwise parse as 1000
+            "1_0.0_1",      # underscores around the fraction
+            "１２３",        # Unicode digits are not ASCII decimal syntax
+            " 25",          # padding is not part of a plain literal
+            "25 ",          # trailing padding
             "0",            # below the 0.001 minimum
             "0.0009",       # below the minimum
             "-5",           # negative
@@ -1027,6 +1033,21 @@ class TestLimitPpm:
         assert isinstance(detail[0]["msg"], str) and detail[0]["msg"]
         for forbidden in ("area", "equivalent", "verdict", "applied_limit"):
             assert forbidden not in response.text
+
+    def test_underscored_limit_is_not_silently_adjudicated(self):
+        # Regression: Decimal("1_00") parses as 100, but the underscore form
+        # must be refused outright, not adjudicated under a limit the
+        # operator never wrote (equivalent 50.000 would PASS at 100).
+        response = client.post(
+            "/adjudicate?limit_ppm=1_00",
+            json=[{"timestamp": 0, "ppm": 50}, {"timestamp": 28800, "ppm": 50}],
+        )
+        assert response.status_code == 422
+        body = response.json()
+        assert set(body.keys()) == {"detail"}
+        assert body["detail"][0]["loc"] == ["query", "limit_ppm"]
+        assert body["detail"][0]["input"] == "1_00"
+        assert "applied_limit" not in response.text
 
     def test_invalid_limit_beats_unparseable_body(self):
         # Even a body that is not JSON at all is never looked at when the

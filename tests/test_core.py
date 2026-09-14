@@ -12,6 +12,8 @@ from app.core import (
     adjudicate,
     analyze_exceedance,
     area_share_percent,
+    check_limit_precision,
+    check_limit_syntax,
     find_dominant_interval,
     find_first_failure,
     format_seconds,
@@ -445,6 +447,45 @@ class TestAnalyzeExceedanceWithCustomThreshold:
         summary = analyze_exceedance(seq, threshold=Decimal("35"))
         assert summary.total_seconds == Decimal("0")
         assert summary.longest is None
+
+
+class TestCheckLimitSyntax:
+    """The limit query parameter accepts only plain decimal literals."""
+
+    @pytest.mark.parametrize(
+        "literal",
+        ["30", "30.500", "0.001", "1000", "999.999", "1.", ".5", "+30", "-5",
+         "1e2", "1E+2", "0.5"],
+    )
+    def test_plain_decimal_literals_pass_through(self, literal):
+        assert check_limit_syntax(literal) == literal
+
+    @pytest.mark.parametrize(
+        "literal",
+        ["1_00", "1_000", "1_0.0_1", "１２３", " 25", "25 ", "", "abc",
+         "1.5.2", "NaN", "Infinity", "0x10", ".", "1e"],
+    )
+    def test_non_plain_forms_are_rejected(self, literal):
+        with pytest.raises(ValueError):
+            check_limit_syntax(literal)
+
+    def test_non_string_input_passes_through_for_the_decimal_parser(self):
+        # Query parameters always arrive as strings; anything else is left
+        # for the decimal parser to judge.
+        assert check_limit_syntax(None) is None
+        assert check_limit_syntax(30) == 30
+
+
+class TestCheckLimitPrecision:
+    @pytest.mark.parametrize("literal", ["30", "30.500", "0.001", "1000.000"])
+    def test_three_or_fewer_lexical_places_pass(self, literal):
+        value = Decimal(literal)
+        assert check_limit_precision(value) is value
+
+    @pytest.mark.parametrize("literal", ["25.0001", "0.0010", "12.3400"])
+    def test_four_lexical_places_are_rejected(self, literal):
+        with pytest.raises(ValueError):
+            check_limit_precision(Decimal(literal))
 
 
 class TestFindDominantInterval:

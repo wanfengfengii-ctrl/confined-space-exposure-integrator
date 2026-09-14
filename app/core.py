@@ -4,9 +4,10 @@ All concentration math uses :class:`decimal.Decimal` so results are exact
 base-10 fixed-point values, never binary floating-point approximations.
 """
 
+import re
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, localcontext
-from typing import Literal, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence
 
 from .models import SamplePoint
 
@@ -120,6 +121,29 @@ def check_limit_precision(limit: Decimal) -> Decimal:
             f"{MAX_LIMIT_DECIMAL_PLACES} decimal places"
         )
     return limit
+
+
+# A plain decimal literal: ASCII digits with an optional sign, fraction, and
+# exponent.  Python's Decimal is more lenient than the limit contract — it
+# accepts underscores ("1_00"), Unicode digits ("１２３"), and surrounding
+# whitespace — so the lexical form is gated on this grammar before parsing.
+_LIMIT_SYNTAX = re.compile(
+    r"[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?"
+)
+
+
+def check_limit_syntax(value: Any) -> Any:
+    """Pass through plain decimal literals, rejecting anything else.
+
+    Plugged into the ``limit_ppm`` query-parameter validator ahead of
+    decimal parsing, so forms that :class:`~decimal.Decimal` would silently
+    normalize — underscores (``1_00``), Unicode digits, padding — are
+    refused with a 422 located at the query parameter instead of being
+    adjudicated under a limit the operator never wrote.
+    """
+    if isinstance(value, str) and not _LIMIT_SYNTAX.fullmatch(value):
+        raise ValueError(f"limit_ppm {value!r} is not a plain decimal number")
+    return value
 
 
 def domain_failure_at(
