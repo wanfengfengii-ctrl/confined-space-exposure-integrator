@@ -33,11 +33,36 @@ class _NonFiniteNumber:
         self.token = token
 
 
+class _JsonObject(dict):
+    """JSON object that remembers keys supplied more than once.
+
+    Standard decoding silently keeps the last value of a duplicated key,
+    but the sampling contract treats a repeated field as an ambiguous
+    structure.  The duplicates are recorded here so point validation can
+    reject them at the correct sample index, keeping the single
+    index-ascending first-error pass intact.
+    """
+
+    def __init__(self, pairs: list[tuple[str, Any]]) -> None:
+        super().__init__()
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for key, value in pairs:
+            if key in seen:
+                duplicates.add(key)
+            seen.add(key)
+            self[key] = value
+        self.duplicates = duplicates
+
+
 def decode_json_body(data: bytes) -> Any:
     """Decode the raw request body, preserving decimal literals exactly."""
     try:
         return json.loads(
-            data, parse_float=Decimal, parse_constant=_NonFiniteNumber
+            data,
+            parse_float=Decimal,
+            parse_constant=_NonFiniteNumber,
+            object_pairs_hook=_JsonObject,
         )
     except (ValueError, RecursionError):
         raise DomainValidationError(
@@ -91,17 +116,35 @@ def _invalid(index: int, message: str) -> DomainValidationError:
     )
 
 
+def _field_name_for_message(name: str) -> str:
+    """Render a client-supplied field name so the 422 envelope stays
+    UTF-8 encodable.
+
+    JSON keys may contain lone surrogates (e.g. ``"\\ud800"``); embedded
+    verbatim in the error message, one would make the error response
+    itself fail to serialize and surface as a server exception instead of
+    the unique first-error envelope.
+    """
+    return name.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _parse_point(index: int, item: Any) -> SamplePoint:
     if not isinstance(item, dict):
         raise _invalid(
             index, "sample point must be an object with 'timestamp' and 'ppm'"
         )
+    if isinstance(item, _JsonObject) and item.duplicates:
+        names = ", ".join(
+            _field_name_for_message(name) for name in sorted(item.duplicates)
+        )
+        raise _invalid(index, f"duplicate field(s): {names}")
     missing = sorted(_POINT_FIELDS - item.keys())
     if missing:
         raise _invalid(index, f"missing field(s): {', '.join(missing)}")
     extra = sorted(set(item) - _POINT_FIELDS)
     if extra:
-        raise _invalid(index, f"unexpected field(s): {', '.join(extra)}")
+        names = ", ".join(_field_name_for_message(name) for name in extra)
+        raise _invalid(index, f"unexpected field(s): {names}")
     timestamp = item["timestamp"]
     if isinstance(timestamp, bool) or not isinstance(timestamp, int):
         raise _invalid(index, "timestamp must be an integer number of seconds")

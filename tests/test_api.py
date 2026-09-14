@@ -325,6 +325,103 @@ class TestMalformedBodies:
         assert_error_envelope(response.json(), 0, "invalid_type")
 
 
+class TestDuplicateFields:
+    """A point repeating a field is ambiguous and must be rejected outright."""
+
+    @pytest.mark.parametrize(
+        "point",
+        [
+            '{"timestamp":0,"timestamp":0,"ppm":1}',
+            '{"timestamp":5,"timestamp":0,"ppm":1}',
+            '{"timestamp":0,"ppm":1,"ppm":2}',
+        ],
+    )
+    def test_duplicate_field_is_invalid_type(self, point):
+        body = f"[{point}," '{"timestamp":28800,"ppm":1}]'
+        response = client.post("/adjudicate", content=body, headers=JSON_HEADERS)
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 0, "invalid_type")
+
+    def test_duplicate_at_higher_index_loses_to_domain_error(self):
+        body = (
+            '[{"timestamp":5,"ppm":1},'
+            '{"timestamp":100,"timestamp":200,"ppm":1},'
+            '{"timestamp":28800,"ppm":1}]'
+        )
+        response = client.post("/adjudicate", content=body, headers=JSON_HEADERS)
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 0, "missing_endpoint")
+
+    def test_duplicate_at_lower_index_beats_domain_error(self):
+        body = (
+            '[{"timestamp":0,"timestamp":1,"ppm":1},'
+            '{"timestamp":100,"ppm":2000},'
+            '{"timestamp":28800,"ppm":1}]'
+        )
+        response = client.post("/adjudicate", content=body, headers=JSON_HEADERS)
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 0, "invalid_type")
+
+
+class TestUnencodableFieldNames:
+    """Lone-surrogate field names must still yield the 422 envelope."""
+
+    def test_surrogate_extra_field_is_invalid_type_not_500(self):
+        body = '[{"timestamp":0,"ppm":1,"\\ud800":2},{"timestamp":28800,"ppm":1}]'
+        response = client.post("/adjudicate", content=body, headers=JSON_HEADERS)
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 0, "invalid_type")
+
+    def test_surrogate_duplicate_field_is_invalid_type_not_500(self):
+        body = (
+            '[{"timestamp":0,"ppm":1,"\\ud800":2,"\\ud800":3},'
+            '{"timestamp":28800,"ppm":1}]'
+        )
+        response = client.post("/adjudicate", content=body, headers=JSON_HEADERS)
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 0, "invalid_type")
+
+
+class TestContentType:
+    """Only JSON media types are adjudicated."""
+
+    @pytest.mark.parametrize(
+        "content_type", ["text/plain", "application/x-www-form-urlencoded"]
+    )
+    def test_non_json_media_type_is_rejected(self, content_type):
+        response = client.post(
+            "/adjudicate",
+            content='[{"timestamp":0,"ppm":1},{"timestamp":28800,"ppm":1}]',
+            headers={"Content-Type": content_type},
+        )
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 0, "invalid_type")
+
+    def test_missing_content_type_is_rejected(self):
+        response = client.post(
+            "/adjudicate",
+            content=b'[{"timestamp":0,"ppm":1},{"timestamp":28800,"ppm":1}]',
+        )
+        assert response.status_code == 422
+        assert_error_envelope(response.json(), 0, "invalid_type")
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            "application/json; charset=utf-8",
+            "Application/JSON",
+            "application/vnd.gas.v1+json",
+        ],
+    )
+    def test_json_media_types_are_accepted(self, content_type):
+        response = client.post(
+            "/adjudicate",
+            content='[{"timestamp":0,"ppm":1},{"timestamp":28800,"ppm":1}]',
+            headers={"Content-Type": content_type},
+        )
+        assert response.status_code == 200
+
+
 class TestExceedance:
     """``include_exceedance`` opt-in threshold-crossing analysis."""
 

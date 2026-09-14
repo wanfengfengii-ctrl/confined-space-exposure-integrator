@@ -122,3 +122,58 @@ class TestValidateSequence:
                 [{"timestamp": 0, "ppm": literal}, {"timestamp": 28800, "ppm": 1}],
             )
             assert (failure.index, failure.category) == (0, CATEGORY_INVALID_TYPE)
+
+
+class TestDuplicateFields:
+    def test_duplicate_field_is_invalid_type(self):
+        failure = failure_of(
+            validate_sequence,
+            decode_json_body(
+                b'[{"timestamp":0,"timestamp":5,"ppm":1},'
+                b'{"timestamp":28800,"ppm":1}]'
+            ),
+        )
+        assert (failure.index, failure.category) == (0, CATEGORY_INVALID_TYPE)
+
+    def test_duplicate_at_higher_index_loses_to_domain_error(self):
+        failure = failure_of(
+            validate_sequence,
+            decode_json_body(
+                b'[{"timestamp":5,"ppm":1},'
+                b'{"timestamp":100,"timestamp":200,"ppm":1},'
+                b'{"timestamp":28800,"ppm":1}]'
+            ),
+        )
+        assert (failure.index, failure.category) == (0, CATEGORY_MISSING_ENDPOINT)
+
+    def test_plain_dicts_without_duplicates_are_unaffected(self):
+        points = validate_sequence(
+            [{"timestamp": 0, "ppm": 1}, {"timestamp": 28800, "ppm": 1}]
+        )
+        assert len(points) == 2
+
+
+class TestUnencodableFieldNames:
+    def test_surrogate_field_name_keeps_message_encodable(self):
+        failure = failure_of(
+            validate_sequence,
+            decode_json_body(
+                b'[{"timestamp":0,"ppm":1,"\\ud800":2},'
+                b'{"timestamp":28800,"ppm":1}]'
+            ),
+        )
+        assert (failure.index, failure.category) == (0, CATEGORY_INVALID_TYPE)
+        # The message must survive UTF-8 encoding, or the 422 envelope
+        # itself would fail to serialize and surface as a server error.
+        failure.message.encode("utf-8")
+
+    def test_surrogate_duplicate_field_name_keeps_message_encodable(self):
+        failure = failure_of(
+            validate_sequence,
+            decode_json_body(
+                b'[{"timestamp":0,"ppm":1,"\\ud800":2,"\\ud800":3},'
+                b'{"timestamp":28800,"ppm":1}]'
+            ),
+        )
+        assert (failure.index, failure.category) == (0, CATEGORY_INVALID_TYPE)
+        failure.message.encode("utf-8")

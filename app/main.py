@@ -1,12 +1,14 @@
 """FastAPI application exposing the eight-hour gas adjudication endpoint."""
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .core import (
+    CATEGORY_INVALID_TYPE,
     DomainValidationError,
+    ValidationFailure,
     adjudicate,
     analyze_exceedance,
     format_seconds,
@@ -104,6 +106,16 @@ async def adjudicate_sequence(
         ),
     ),
 ) -> AdjudicationResult:
+    # The contract is a single JSON sampling sequence; anything submitted
+    # without a JSON media type is rejected before any parsing happens.
+    if not _is_json_content_type(request.headers.get("content-type")):
+        raise DomainValidationError(
+            ValidationFailure(
+                index=0,
+                category=CATEGORY_INVALID_TYPE,
+                message="request Content-Type must be application/json",
+            )
+        )
     # The raw body is decoded and validated by the domain layer (not by the
     # framework) so decimal literals keep their exact lexical form and every
     # 422 carries the unique first failure as index + category.
@@ -134,6 +146,20 @@ def _build_exceedance(points: Sequence[SamplePoint]) -> Exceedance:
     return Exceedance(
         total_seconds=format_seconds(summary.total_seconds),
         longest_segment=longest,
+    )
+
+
+def _is_json_content_type(content_type: Optional[str]) -> bool:
+    """Whether the request declared a JSON media type.
+
+    Only ``application/json`` (or an ``application/*+json`` suffix type)
+    is adjudicated; parameters such as ``; charset=utf-8`` are ignored.
+    """
+    if not content_type:
+        return False
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type == "application/json" or (
+        media_type.startswith("application/") and media_type.endswith("+json")
     )
 
 
