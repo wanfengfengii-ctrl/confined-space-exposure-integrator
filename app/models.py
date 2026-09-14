@@ -10,9 +10,9 @@ class SamplePoint(BaseModel):
     """One gas-concentration sample.
 
     ``timestamp`` is an integer number of seconds since the start of the
-    eight-hour window; ``ppm`` is a decimal concentration. Pydantic rejects
-    non-integer timestamps, non-numeric or non-finite ppm values, and any
-    unexpected extra keys before domain validation ever runs.
+    eight-hour window; ``ppm`` is a decimal concentration.  On the wire,
+    ``timestamp`` must be a JSON integer and ``ppm`` a JSON number — that
+    contract is enforced by the parsing layer before this model is built.
     """
 
     model_config = ConfigDict(extra="forbid")

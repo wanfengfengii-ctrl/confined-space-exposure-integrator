@@ -11,7 +11,7 @@ error by sample index regardless of which layer produced it.
 """
 
 import json
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from .core import (
@@ -110,19 +110,15 @@ def _parse_point(index: int, item: Any) -> SamplePoint:
 
 
 def _parse_ppm(index: int, value: Any) -> Decimal:
+    # ppm must be a JSON number; strings (even numeric ones) are type errors.
     if isinstance(value, Decimal):
         ppm = value
     elif isinstance(value, bool) or value is None:
-        raise _invalid(index, "ppm must be a decimal number")
+        raise _invalid(index, "ppm must be a JSON number")
     elif isinstance(value, int):
         ppm = Decimal(value)
-    elif isinstance(value, str):
-        try:
-            ppm = Decimal(value)
-        except InvalidOperation:
-            raise _invalid(index, "ppm must be a decimal number") from None
     else:
-        raise _invalid(index, "ppm must be a decimal number")
+        raise _invalid(index, "ppm must be a JSON number")
     if not ppm.is_finite():
         raise _invalid(index, "ppm must be a finite decimal number")
     return ppm

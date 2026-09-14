@@ -75,21 +75,6 @@ class TestSuccess:
         assert response.json()["equivalent"] == "25.001"
         assert response.json()["verdict"] == "FAIL"
 
-    def test_ppm_accepts_decimal_strings(self):
-        response = client.post(
-            "/adjudicate",
-            json=[
-                {"timestamp": 0, "ppm": "12.345"},
-                {"timestamp": 28800, "ppm": "12.345"},
-            ],
-        )
-        assert response.status_code == 200
-        assert response.json() == {
-            "area": "355536.000",
-            "equivalent": "12.345",
-            "verdict": "PASS",
-        }
-
     def test_two_point_sequence_is_accepted(self):
         response = client.post(
             "/adjudicate",
@@ -228,7 +213,9 @@ class TestLexicalPrecision:
         response = client.post("/adjudicate", content=body, headers=JSON_HEADERS)
         assert response.status_code == 200
 
-    def test_four_decimal_place_string_is_rejected(self):
+    def test_string_ppm_is_a_type_error_not_precision(self):
+        # A string is the wrong JSON type entirely; it must not be treated
+        # as a precision problem even when the literal has four decimals.
         response = client.post(
             "/adjudicate",
             json=[
@@ -237,7 +224,7 @@ class TestLexicalPrecision:
             ],
         )
         assert response.status_code == 422
-        assert_error_envelope(response.json(), 0, "ppm_precision_exceeded")
+        assert_error_envelope(response.json(), 0, "invalid_type")
 
 
 class TestTypeErrors:
@@ -250,6 +237,8 @@ class TestTypeErrors:
             ([{"timestamp": True, "ppm": 1}, {"timestamp": 28800, "ppm": 1}], 0),
             ([{"timestamp": "0", "ppm": 1}, {"timestamp": 28800, "ppm": 1}], 0),
             ([{"timestamp": 0, "ppm": "abc"}, {"timestamp": 28800, "ppm": 1}], 0),
+            ([{"timestamp": 0, "ppm": "12.340"}, {"timestamp": 28800, "ppm": 1}], 0),
+            ([{"timestamp": 0, "ppm": "12"}, {"timestamp": 28800, "ppm": 1}], 0),
             ([{"timestamp": 0, "ppm": None}, {"timestamp": 28800, "ppm": 1}], 0),
             ([{"timestamp": 0, "ppm": True}, {"timestamp": 28800, "ppm": 1}], 0),
             ([{"timestamp": 0, "ppm": [1]}, {"timestamp": 28800, "ppm": 1}], 0),

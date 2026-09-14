@@ -113,9 +113,12 @@ class TestValidateSequence:
         )
         assert (failure.index, failure.category) == (0, CATEGORY_INVALID_TYPE)
 
-    def test_string_ppm_precision_applies_to_literal(self):
-        failure = failure_of(
-            validate_sequence,
-            [{"timestamp": 0, "ppm": "12.3400"}, {"timestamp": 28800, "ppm": 1}],
-        )
-        assert (failure.index, failure.category) == (0, CATEGORY_PPM_PRECISION_EXCEEDED)
+    def test_string_ppm_is_a_type_error(self):
+        # ppm must be a JSON number; even a well-formed decimal string is
+        # rejected as a type error, never adjudicated.
+        for literal in ("12.340", "12.3400", "abc"):
+            failure = failure_of(
+                validate_sequence,
+                [{"timestamp": 0, "ppm": literal}, {"timestamp": 28800, "ppm": 1}],
+            )
+            assert (failure.index, failure.category) == (0, CATEGORY_INVALID_TYPE)
